@@ -12,6 +12,7 @@ Steps (all on the active edit-mode mesh):
 """
 
 import math
+import random
 
 import bmesh
 import bpy
@@ -65,6 +66,64 @@ def _self_overlaps(faces, uv_layer):
     return boundary_crossings(np.array(pts), np.array(tris)) > 0
 
 
+def _tris_overlap(a, b, eps):
+    """Separating-axis test for two 2D triangles (touching is not overlap)."""
+    for tri in (a, b):
+        for i in range(3):
+            (px, py), (qx, qy) = tri[i], tri[(i + 1) % 3]
+            nx, ny = qy - py, px - qx
+            ln = math.hypot(nx, ny)
+            if ln < 1e-15:
+                continue
+            nx /= ln
+            ny /= ln
+            pa = [nx * x + ny * y for x, y in a]
+            pb = [nx * x + ny * y for x, y in b]
+            if max(pa) <= min(pb) + eps or max(pb) <= min(pa) + eps:
+                return False
+    return True
+
+
+def _faces_overlap(faces, uv_layer):
+    """True if any two faces of the island cover the same UV area.
+
+    Catches folds that keep every face's orientation and a clean outline
+    (Follow Active Quads round a pole vertex can lay one quad on another).
+    """
+    tris = []
+    for f in faces:
+        uv = [(l[uv_layer].uv.x, l[uv_layer].uv.y) for l in f.loops]
+        for i in range(1, len(uv) - 1):
+            tris.append((f.index, (uv[0], uv[i], uv[i + 1])))
+    if not tris:
+        return False
+    xs = [p[0] for _, t in tris for p in t]
+    ys = [p[1] for _, t in tris for p in t]
+    size = max(max(xs) - min(xs), max(ys) - min(ys), 1e-12)
+    eps = size * 1e-6
+    cell = size / max(1.0, math.sqrt(len(tris)))
+    grid = {}
+    for k, (_, t) in enumerate(tris):
+        x0 = int(min(p[0] for p in t) // cell)
+        x1 = int(max(p[0] for p in t) // cell)
+        y0 = int(min(p[1] for p in t) // cell)
+        y1 = int(max(p[1] for p in t) // cell)
+        for gx in range(x0, x1 + 1):
+            for gy in range(y0, y1 + 1):
+                grid.setdefault((gx, gy), []).append(k)
+    tested = set()
+    for members in grid.values():
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                a, b = members[i], members[j]
+                if tris[a][0] == tris[b][0] or (a, b) in tested:
+                    continue
+                tested.add((a, b))
+                if _tris_overlap(tris[a][1], tris[b][1], eps):
+                    return True
+    return False
+
+
 def _snapshot(faces, uv_layer):
     return {(f.index, i): l[uv_layer].uv.copy() for f in faces for i, l in enumerate(f.loops)}
 
@@ -91,61 +150,179 @@ def _square_active(face, uv_layer):
         l[uv_layer].uv = (c.x + x, c.y + y)
 
 
-def straighten_quad_islands(obj, charts, max_stretch=0.12):
+def _area_and_angle_error(faces, uv_layer):
+    """(area stretch, mean angle error in radians), both area weighted.
+
+    The area term is the same measure as the metrics' worst shell stretch.
+    """
+    a3 = sum(f.calc_area() for f in faces)
+    a2 = sum(abs(metrics._uv_area(f, uv_layer)) for f in faces)
+    if a3 <= 0 or a2 <= 1e-12:
+        return float("inf"), float("inf")
+    k = a2 / a3
+    area = angle = 0.0
+    for f in faces:
+        fa = f.calc_area()
+        if fa <= 0:
+            continue
+        r = abs(metrics._uv_area(f, uv_layer)) / (fa * k)
+        area += fa * abs(math.log(max(r, 1e-6)))
+        ang3 = [l.calc_angle() for l in f.loops]
+        ang2 = metrics._uv_corner_angles(f, uv_layer)
+        angle += fa * sum(abs(x - y) for x, y in zip(ang3, ang2)) / len(ang3)
+    return area / a3, angle / a3
+
+
+def _active_candidates(faces, count):
+    """Faces to try as the active quad: the largest ones plus an even spread."""
+    by_area = sorted(faces, key=lambda f: -f.calc_area())
+    out = by_area[:max(1, count // 2)]
+    step = max(1, len(faces) // max(1, count - len(out)))
+    for f in faces[::step]:
+        if len(out) >= count:
+            break
+        if f not in out:
+            out.append(f)
+    return out
+
+
+def straighten_quad_islands(obj, charts, max_stretch=0.12, max_area=0.1,
+                            max_angle=math.radians(10.5), tries=12):
     """Follow-Active-Quads on all-quad charts (rims, bands, leg strips).
 
-    Kept when the straightened island stays under ``max_stretch`` (or is no
-    worse than the original unwrap): straight strips pack tighter and are
-    much easier to paint on.
+    Straight strips pack far tighter than arcs and are much easier to paint
+    on. A straightened island is kept when it neither overlaps nor flips and
+
+    * its combined stretch stays under ``max_stretch`` (or within 15 % of
+      the unwrap), or
+    * its area stretch stays under ``max_area`` and its mean angle error
+      under ``max_angle``: a gently tapered band (a lamp's conical side) may
+      trade a little angle error for a straight strip, but never more area
+      stretch than the strict limit.
+
+    Follow Active Quads depends on which quad it starts from, so several
+    active faces are tried and the least distorted acceptable result wins.
+
+    Returns ``(count, relaxed)``: the number of straightened charts, and for
+    those kept only under the relaxed (angle-trading) rule, a map of chart
+    index -> UV snapshot of the unwrap, so the caller can undo them when
+    the long strip they make costs more texture space than it is worth.
     """
     me = obj.data
     straightened = 0
-    for faces_idx in charts:
+    relaxed = {}
+    for ci, faces_idx in enumerate(charts):
         bm = bmesh.from_edit_mesh(me)
         bm.faces.ensure_lookup_table()
         uv_layer = bm.loops.layers.uv.active
         faces = [bm.faces[i] for i in faces_idx]
-        if len(faces) < 2 or any(len(f.verts) != 4 for f in faces):
+        if len(faces) < 2 or any(len(f.verts) != 4 or f.hide for f in faces):
             continue
         before = _island_stretch(faces, uv_layer)
+        area0, angle0 = _area_and_angle_error(faces, uv_layer)
         snap = _snapshot(faces, uv_layer)
-        # active = largest face (most representative of the strip)
-        active = max(faces, key=lambda f: f.calc_area())
-        for f in bm.faces:
-            f.select = False
-        for f in faces:
-            f.select = True
-        bm.faces.active = active
-        _square_active(active, uv_layer)
-        bmesh.update_edit_mesh(me)
-        try:
-            bpy.ops.uv.follow_active_quads(mode='LENGTH_AVERAGE')
-        except RuntimeError:
+        best = None
+        for active_idx in [f.index for f in _active_candidates(faces, tries)]:
             bm = bmesh.from_edit_mesh(me)
-            uv_layer = bm.loops.layers.uv.active
             bm.faces.ensure_lookup_table()
-            _restore([bm.faces[i] for i in faces_idx], uv_layer, snap)
+            uv_layer = bm.loops.layers.uv.active
+            faces = [bm.faces[i] for i in faces_idx]
+            _restore(faces, uv_layer, snap)
+            # Follow Active Quads needs the active face selected and visible
+            # (else "Active face not selected"): select only this chart, with
+            # verts and edges, and flush so the selection is consistent
+            for f in bm.faces:
+                f.select_set(False)
+            for f in faces:
+                f.select_set(True)
+            bm.select_flush(True)
+            active = bm.faces[active_idx]
+            bm.faces.active = active
+            _square_active(active, uv_layer)
             bmesh.update_edit_mesh(me)
-            continue
+            try:
+                bpy.ops.uv.follow_active_quads(mode='LENGTH_AVERAGE')
+            except RuntimeError:
+                continue
+            bm = bmesh.from_edit_mesh(me)
+            bm.faces.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.active
+            faces = [bm.faces[i] for i in faces_idx]
+            after = _island_stretch(faces, uv_layer)
+            area, angle = _area_and_angle_error(faces, uv_layer)
+            strict = after <= max(before * 1.15, max_stretch)
+            ok = strict or (area <= max(area0 * 1.15, max_area) and
+                            angle <= max(angle0 * 1.15, max_angle))
+            if (ok and (best is None or (not strict, after) < best[:2])
+                    and not _self_overlaps(faces, uv_layer)
+                    and not _faces_overlap(faces, uv_layer)):
+                best = (not strict, after, _snapshot(faces, uv_layer))
         bm = bmesh.from_edit_mesh(me)
         bm.faces.ensure_lookup_table()
         uv_layer = bm.loops.layers.uv.active
         faces = [bm.faces[i] for i in faces_idx]
-        after = _island_stretch(faces, uv_layer)
-        if after <= max(before * 1.15, max_stretch) and not _self_overlaps(faces, uv_layer):
-            straightened += 1
-        else:
+        if best is None:
             _restore(faces, uv_layer, snap)
+        else:
+            _restore(faces, uv_layer, best[2])
+            straightened += 1
+            if best[0]:
+                relaxed[ci] = snap
         bmesh.update_edit_mesh(me)
-    return straightened
+    return straightened, relaxed
 
 
-def align_to_grid(obj, charts, min_agreement=0.9, anchors=()):
+def _grid_rotation(loops, uv_layer, min_agreement, tol=math.radians(4.0)):
+    """Rotation that puts the shell's dominant edge grid on the UV axes.
+
+    Edge directions are taken modulo 90°. The dominant direction is the one
+    with the most edge length within ``tol`` of it (a bevelled corner or a
+    splayed foot does not drag it off, as it would a plain mean). Returns
+    None unless at least ``min_agreement`` of the edge length lies on that
+    grid.
+    """
+    dirs, total = [], 0.0
+    for l in loops:
+        d = l.link_loop_next[uv_layer].uv - l[uv_layer].uv
+        w = d.length
+        if w < 1e-12:
+            continue
+        dirs.append((math.atan2(d.y, d.x) % (math.pi / 2), w))
+        total += w
+    if total <= 0:
+        return None
+
+    def support(a):
+        return sum(w for b, w in dirs
+                   if abs(math.remainder(b - a, math.pi / 2)) <= tol)
+
+    # histogram in 0.5° bins, circular window of +-tol
+    nb = 180
+    hist = [0.0] * nb
+    for b, w in dirs:
+        hist[int(b / (math.pi / 2) * nb) % nb] += w
+    half = max(1, int(round(tol / (math.pi / 2) * nb)))
+    window = [sum(hist[(i + k) % nb] for k in range(-half, half + 1)) for i in range(nb)]
+    best = (max(range(nb), key=window.__getitem__) + 0.5) * (math.pi / 2) / nb
+    # refine: length-weighted mean of the inliers around the peak
+    sx = sy = 0.0
+    for b, w in dirs:
+        if abs(math.remainder(b - best, math.pi / 2)) <= tol:
+            sx += w * math.cos(4.0 * b)
+            sy += w * math.sin(4.0 * b)
+    peak = math.atan2(sy, sx) / 4.0
+    if support(peak) < min_agreement * total:
+        return None
+    return -peak
+
+
+def align_to_grid(obj, charts, min_agreement=0.5, anchors=()):
     """Turn grid-shaped shells so their edges line up with the UV grid.
 
-    The rotation is the length-weighted mean edge direction (modulo 90°).
-    It is applied only when the edges clearly agree on one grid (box sides,
-    straight strips); irregular shells are left for the packer to rotate.
+    The rotation is the dominant edge direction (modulo 90°). It is applied
+    when at least ``min_agreement`` of the shell's edge length lies on one
+    grid (box sides, straight strips, a leg strip with a splayed foot);
+    irregular shells are left for the packer to rotate.
     Shells with vertical walls are then turned in 90° steps so the object's
     up direction points up in UV.
 
@@ -164,20 +341,10 @@ def align_to_grid(obj, charts, min_agreement=0.9, anchors=()):
     for ci, faces_idx in enumerate(charts):
         faces = [bm.faces[i] for i in faces_idx]
         loops = [l for f in faces for l in f.loops]
-        sx = sy = total = 0.0
-        for l in loops:
-            d = l.link_loop_next[uv_layer].uv - l[uv_layer].uv
-            w = d.length
-            if w < 1e-12:
-                continue
-            a = 4.0 * math.atan2(d.y, d.x)
-            sx += w * math.cos(a)
-            sy += w * math.sin(a)
-            total += w
-        if total <= 0 or math.hypot(sx, sy) < min_agreement * total:
+        rot = _grid_rotation(loops, uv_layer, min_agreement)
+        if rot is None:
             continue
         aligned.append(ci)
-        rot = -math.atan2(sy, sx) / 4.0
         # which way does 3D "up" run in UV after that rotation?
         ux = uy = 0.0
         c, s = math.cos(rot), math.sin(rot)
@@ -221,6 +388,369 @@ def set_pinned(obj, charts, pinned):
             for l in bm.faces[fi].loops:
                 l[uv_layer].pin_uv = pinned
     bmesh.update_edit_mesh(me)
+
+
+PACK_VARIANTS = (
+    ('CONCAVE', 'ANY'),
+    ('CONCAVE', 'AXIS_ALIGNED'),
+)
+
+
+def _uv_area_total(bm, uv_layer):
+    return sum(abs(metrics._uv_area(f, uv_layer)) for f in bm.faces)
+
+
+def rotate_chart(faces, uv_layer, angle):
+    """Turn one island about its centroid."""
+    loops = [l for f in faces for l in f.loops]
+    cx = sum(l[uv_layer].uv.x for l in loops) / len(loops)
+    cy = sum(l[uv_layer].uv.y for l in loops) / len(loops)
+    c, s = math.cos(angle), math.sin(angle)
+    for l in loops:
+        x, y = l[uv_layer].uv.x - cx, l[uv_layer].uv.y - cy
+        l[uv_layer].uv = (cx + c * x - s * y, cy + s * x + c * y)
+
+
+def _rasterize(tris, pad):
+    """Conservative mask of 2D triangles (``tris``: N x 3 x 2, already in
+    pixel units, min corner at 0): every pixel the triangles touch is set.
+
+    Pixel centres inside a triangle are set, plus every pixel an edge passes
+    through (edges are sampled at half-pixel steps), then grown by one pixel:
+    any point of a triangle lies within one pixel of a set pixel.
+    """
+    import numpy as np
+    w = int(math.ceil(tris[..., 0].max())) + 2 * pad + 2
+    h = int(math.ceil(tris[..., 1].max())) + 2 * pad + 2
+    grid = np.zeros((h, w), dtype=bool)
+    t = tris + pad
+    for (ax, ay), (bx, by), (cx, cy) in t:
+        x0, x1 = int(min(ax, bx, cx)), int(math.ceil(max(ax, bx, cx)))
+        y0, y1 = int(min(ay, by, cy)), int(math.ceil(max(ay, by, cy)))
+        den = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        if abs(den) > 1e-12:
+            px, py = np.meshgrid(np.arange(x0, x1 + 1) + 0.5, np.arange(y0, y1 + 1) + 0.5)
+            w1 = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) / den
+            w2 = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / den
+            grid[y0:y1 + 1, x0:x1 + 1] |= (w1 >= 0) & (w2 >= 0) & (w1 + w2 <= 1)
+        for (sx, sy), (ex, ey) in (((ax, ay), (bx, by)), ((bx, by), (cx, cy)), ((cx, cy), (ax, ay))):
+            n = int(math.hypot(ex - sx, ey - sy) * 2) + 2
+            s = np.linspace(0.0, 1.0, n)
+            grid[(sy + (ey - sy) * s).astype(int), (sx + (ex - sx) * s).astype(int)] = True
+    return _dilate(grid, 1)
+
+
+def _dilate(grid, k):
+    """Grow a mask by ``k`` pixels (square neighbourhood)."""
+    import numpy as np
+    out = grid.copy()
+    for _ in range(k):
+        g = out.copy()
+        g[1:, :] |= out[:-1, :]
+        g[:-1, :] |= out[1:, :]
+        g2 = g.copy()
+        g2[:, 1:] |= g[:, :-1]
+        g2[:, :-1] |= g[:, 1:]
+        out = g2
+    return out
+
+
+def _min_rect_angle(points):
+    """Rotation that turns a point set to its minimal-area bounding box."""
+    import numpy as np
+    pts = np.unique(np.round(points, 9), axis=0)
+    if len(pts) < 3:
+        return 0.0
+    # convex hull (monotone chain)
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    def half(seq):
+        out = []
+        for p in seq:
+            while len(out) >= 2 and ((out[-1][0] - out[-2][0]) * (p[1] - out[-2][1]) -
+                                     (out[-1][1] - out[-2][1]) * (p[0] - out[-2][0])) <= 0:
+                out.pop()
+            out.append(p)
+        return out
+    hull = np.array(half(pts)[:-1] + half(pts[::-1])[:-1])
+    best = (float("inf"), 0.0)
+    for i in range(len(hull)):
+        d = hull[(i + 1) % len(hull)] - hull[i]
+        a = -math.atan2(d[1], d[0])
+        c, s = math.cos(a), math.sin(a)
+        x = hull[:, 0] * c - hull[:, 1] * s
+        y = hull[:, 0] * s + hull[:, 1] * c
+        area = (x.max() - x.min()) * (y.max() - y.min())
+        if area < best[0]:
+            best = (area, a)
+    return best[1]
+
+
+def raster_pack(islands, margin, coverage_floor, res=300, steps=6, n_angles=16,
+                strategies=(('area', 'top'), ('bbox', 'corner'))):
+    """Bottom-left raster packer with free rotation for irregular islands.
+
+    ``islands``: list of ``(tris, pinned)`` with ``tris`` an N x 3 x 2 numpy
+    array in UV units (all islands at their final relative scale, total
+    area about 1). Pinned islands keep their rotation; the others try
+    ``n_angles`` turns starting from their minimal bounding box. Each
+    strategy (island order: by area or by bounding box; spot: lowest top
+    edge, or smallest square from the corner) is tried in turn at every
+    texture size until one fits everything.
+
+    Masks are conservative rasterisations grown by half the margin, so two
+    placed islands are always at least ``margin`` apart (a pixel more, at
+    worst). The texture size in pixels is binary searched between the
+    coverage Blender's packer reached (``coverage_floor``) and 40 % more.
+
+    Returns ``(coverage, [(angle, scale, tx, ty) per island])`` mapping a UV
+    point p to ``rot(angle) @ p * scale + (tx, ty)``, or None if it found
+    nothing better than ``coverage_floor``.
+    """
+    import numpy as np
+    areas = [float(np.abs(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])).sum()) * 0.5
+             for t, _ in islands]
+    area = sum(areas)
+    if area <= 0:
+        return None
+    order = sorted(range(len(islands)), key=lambda i: -areas[i])
+
+    # coverage = area * res^2 / size^2
+    def size_for(cov):
+        return int(math.ceil(res * math.sqrt(area / cov)))
+
+    lo_size, hi_size = size_for(coverage_floor * 1.4), size_for(coverage_floor)
+    # room round each raw mask for the margin it grows by later
+    pad = int(math.ceil(margin * 0.5 * hi_size)) + 2
+    # candidate rotations and their raw masks (pixel size 1 / res UV units)
+    cands = []
+    for tris, pinned in islands:
+        pts = tris.reshape(-1, 2)
+        if pinned:
+            angles = [0.0]
+        else:
+            a0 = _min_rect_angle(pts)
+            angles = [a0 + k * 2 * math.pi / n_angles for k in range(n_angles)]
+        cs = []
+        for a in angles:
+            c, s = math.cos(a), math.sin(a)
+            rot = np.array([[c, -s], [s, c]])
+            t = tris @ rot.T
+            lo = t.reshape(-1, 2).min(axis=0)
+            cs.append((a, lo, _rasterize((t - lo) * res, pad)))
+        cands.append(cs)
+
+    def attempt(size, order, score):
+        """Place everything in a size x size pixel texture, or None."""
+        k = int(math.ceil(margin * 0.5 * size))  # half margin, in pixels
+        occ = np.zeros((size, size), dtype=float)
+        placed = [None] * len(islands)
+        for i in order:
+            occ_f = np.fft.rfft2(occ)
+            best = None
+            for a, lo, raw in cands[i]:
+                m = _dilate(raw, k)
+                ys, xs = np.nonzero(m)
+                j0, j1, i0, i1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+                m = m[j0:j1, i0:i1]
+                h, w = m.shape
+                if h > size or w > size:
+                    continue
+                mp = np.zeros((size, size))
+                mp[:h, :w] = m
+                hit = np.fft.irfft2(occ_f * np.conj(np.fft.rfft2(mp)), s=(size, size))
+                free = hit[:size - h + 1, :size - w + 1] < 0.5
+                if not free.any():
+                    continue
+                if score == 'top':
+                    # lowest top edge, then leftmost
+                    rows = np.nonzero(free.any(axis=1))[0]
+                    y = int(rows[0])
+                    x = int(np.nonzero(free[y])[0][0])
+                    key = (y + h, x)
+                else:
+                    # 'corner': smallest square from the origin that holds it
+                    yy, xx = np.nonzero(free)
+                    ext = np.maximum(yy + h, xx + w)
+                    j = int(np.lexsort((xx + yy, ext))[0])
+                    y, x = int(yy[j]), int(xx[j])
+                    key = (int(ext[j]), x + y)
+                if best is None or key < best[0]:
+                    best = (key, a, lo, m, x, y, i0, j0)
+            if best is None:
+                return None
+            _, a, lo, m, x, y, i0, j0 = best
+            occ[y:y + m.shape[0], x:x + m.shape[1]] += m
+            placed[i] = (a, lo, x - i0, y - j0)
+        return placed
+
+    bbox = []
+    for cs in cands:
+        _, _, raw = cs[0]
+        ys, xs = np.nonzero(raw)
+        bbox.append(float((ys.ptp() + 1) * (xs.ptp() + 1)))
+    orders = {
+        'area': order,
+        'bbox': sorted(range(len(islands)), key=lambda i: -bbox[i]),
+    }
+
+    def attempt_any(size):
+        for o, sc in strategies:
+            got = attempt(size, orders[o], sc)
+            if got is not None:
+                return got
+        return None
+
+    best = None
+    for _ in range(steps):
+        if hi_size - lo_size <= 1:
+            break
+        mid = (lo_size + hi_size) // 2
+        got = attempt_any(mid)
+        if got is None:
+            lo_size = mid
+        else:
+            hi_size, best = mid, (mid, got)
+    if best is None:
+        return None
+    size, placed = best
+    out = []
+    for (tris, _), (a, lo, ox, oy) in zip(islands, placed):
+        # pixel q = (rot(a) p - lo) * res + pad; texture px = q + (ox, oy)
+        sc = res / size
+        out.append((a, sc, (-lo[0] * res + pad + ox) / size, (-lo[1] * res + pad + oy) / size))
+    return area * (res / size) ** 2, out
+
+
+def pack(obj, charts, pinned_charts=(), margin=0.01, variants=PACK_VARIANTS, starts=4,
+         use_raster=True):
+    """Pack all islands into 0-1 as tightly as Blender's packer allows.
+
+    * Islands keep their relative scale (equal texel density, then the
+      visibility scaling), so packing only scales the whole layout.
+    * ``pinned_charts`` (grid-aligned shells) keep their rotation; the
+      packer may turn the others freely.
+    * ``margin`` is the gap between two islands, as a fraction of the
+      texture (0.01 = about 10 px at 1K, enough for a few mip levels); each
+      island gets half of it on every side, so the gap to the texture border
+      is ``margin / 2``. (Blender's own margin is padding *per island*, so
+      passing it straight through made every gap twice the setting.) It is
+      given to the packer as an absolute (ADD) margin, calibrated from the
+      scale the layout ends up at.
+    * Several shape / rotation settings are tried, and with free rotation
+      also ``starts - 1`` seeded random turns of the free shells (Blender's
+      packer only searches near each island's current angle); the best
+      coverage wins. The seed is fixed, so results are repeatable.
+
+    Returns ``(coverage, shape_method, rotate_method)`` of the kept layout.
+    """
+    me = obj.data
+    bm = bmesh.from_edit_mesh(me)
+    bm.faces.ensure_lookup_table()
+    uv_layer = bm.loops.layers.uv.active
+    for f in bm.faces:
+        f.select_set(True)
+    # normalise: total UV area 1 (uniform, so texel ratios are unchanged)
+    area = _uv_area_total(bm, uv_layer)
+    if area > 1e-12:
+        s = 1.0 / math.sqrt(area)
+        for f in bm.faces:
+            for l in f.loops:
+                l[uv_layer].uv = l[uv_layer].uv * s
+    snap = _snapshot(bm.faces, uv_layer)
+    bmesh.update_edit_mesh(me)
+    pinned_faces = {fi for c in pinned_charts for fi in c}
+    free = [c for c in charts if not set(c) & pinned_faces]
+    rng = random.Random(1)
+
+    def start_layout(k):
+        """UVs to pack from: as unwrapped, or with the free shells turned
+        (Blender's packer only tries a few angles around the current one)."""
+        if k == 0:
+            return snap
+        bm = bmesh.from_edit_mesh(me)
+        bm.faces.ensure_lookup_table()
+        uv = bm.loops.layers.uv.active
+        _restore(bm.faces, uv, snap)
+        for c in free:
+            rotate_chart([bm.faces[i] for i in c], uv, rng.uniform(0.0, 2.0 * math.pi))
+        return _snapshot(bm.faces, uv)
+
+    def run(start, shape, rot, m):
+        bm = bmesh.from_edit_mesh(me)
+        bm.faces.ensure_lookup_table()
+        _restore(bm.faces, bm.loops.layers.uv.active, start)
+        bmesh.update_edit_mesh(me)
+        set_pinned(obj, pinned_charts, True)
+        try:
+            bpy.ops.uv.pack_islands(rotate=True, rotate_method=rot, scale=True,
+                                    margin_method='ADD', margin=m, shape_method=shape,
+                                    pin=True, pin_method='ROTATION')
+        finally:
+            set_pinned(obj, pinned_charts, False)
+        bm = bmesh.from_edit_mesh(me)
+        return _uv_area_total(bm, bm.loops.layers.uv.active)
+
+    margin = margin * 0.5  # per island side
+    best = None
+    # final linear scale = sqrt(coverage); the margin scales with it
+    m = margin / math.sqrt(0.5)
+    for k in range(starts if free else 1):
+        start = start_layout(k)
+        for shape, rot in variants:
+            if k and rot != 'ANY':
+                continue  # turning the start only matters to free rotation
+            for _ in range(3):
+                cov = run(start, shape, rot, m)
+                m_new = margin / math.sqrt(max(cov, 1e-6))
+                if abs(m_new - m) <= 0.03 * m:
+                    break
+                m = m_new
+            # keep it only if the gap is at least the requested one
+            if m * math.sqrt(cov) < margin * 0.97:
+                m = m_new
+                cov = run(start, shape, rot, m)
+                if m * math.sqrt(cov) < margin * 0.97:
+                    continue
+            if best is None or cov > best[0] + 1e-9:
+                bm = bmesh.from_edit_mesh(me)
+                best = (cov, shape, rot, _snapshot(bm.faces, bm.loops.layers.uv.active))
+    if best is None:  # calibration never settled: plain run, margin as given
+        cov = run(snap, 'CONCAVE', 'AXIS_ALIGNED', margin / math.sqrt(0.5))
+        bm = bmesh.from_edit_mesh(me)
+        best = (cov, 'CONCAVE', 'AXIS_ALIGNED', _snapshot(bm.faces, bm.loops.layers.uv.active))
+
+    # second opinion: raster packer with free rotation (nests concave shells)
+    if use_raster and len(charts) > 1:
+        import numpy as np
+        bm = bmesh.from_edit_mesh(me)
+        bm.faces.ensure_lookup_table()
+        uv = bm.loops.layers.uv.active
+        islands = []
+        for c in charts:
+            tris = []
+            for fi in c:
+                pts = [tuple(snap[(fi, j)]) for j in range(len(bm.faces[fi].loops))]
+                tris += [(pts[0], pts[j], pts[j + 1]) for j in range(1, len(pts) - 1)]
+            islands.append((np.array(tris, dtype=float), bool(set(c) & pinned_faces)))
+        got = raster_pack(islands, margin * 2.0, best[0])
+        if got is not None:
+            for c, (a, sc, tx, ty) in zip(charts, got[1]):
+                ca, sa = math.cos(a) * sc, math.sin(a) * sc
+                for fi in c:
+                    for j, l in enumerate(bm.faces[fi].loops):
+                        x, y = snap[(fi, j)]
+                        l[uv].uv = (ca * x - sa * y + tx, sa * x + ca * y + ty)
+            cov = _uv_area_total(bm, uv)
+            inside = all(-1e-6 <= l[uv].uv.x <= 1 + 1e-6 and -1e-6 <= l[uv].uv.y <= 1 + 1e-6
+                         for f in bm.faces for l in f.loops)
+            if cov > best[0] and inside and not _faces_overlap(list(bm.faces), uv):
+                best = (cov, 'RASTER', 'ANY', _snapshot(bm.faces, uv))
+    bm = bmesh.from_edit_mesh(me)
+    bm.faces.ensure_lookup_table()
+    _restore(bm.faces, bm.loops.layers.uv.active, best[3])
+    bmesh.update_edit_mesh(me)
+    return best[0], best[1], best[2]
 
 
 def scale_by_visibility(obj, charts, visibility, min_scale=0.5, matrix_world=None):

@@ -52,7 +52,8 @@ def _front_vector(obj, opts):
 def _ensure_edit_mode(obj):
     view_layer = bpy.context.view_layer
     for o in view_layer.objects:
-        o.select_set(o is obj)
+        if o is not None:
+            o.select_set(o is obj)
     view_layer.objects.active = obj
     if obj.mode != 'EDIT':
         bpy.ops.object.mode_set(mode='EDIT')
@@ -98,7 +99,8 @@ def unwrap(obj, opts=None):
     opts = opts or Options()
     t0 = time.perf_counter()
     prev_mode = obj.mode
-    if not obj.data.uv_layers:
+    # marking seams only must not leave an empty all-zero UV map behind
+    if not obj.data.uv_layers and not opts.mark_seams_only:
         obj.data.uv_layers.new(name="UVMap")
 
     charts, vis, stats = solve_seams(obj, opts)
@@ -112,26 +114,42 @@ def unwrap(obj, opts=None):
         bmesh.update_edit_mesh(me)
         bpy.ops.uv.unwrap(method=opts.unwrap_method, fill_holes=True,
                           correct_aspect=True, margin=0.0)
+        relaxed = {}
         if opts.straighten:
-            report["straightened"] = layout.straighten_quad_islands(obj, charts)
+            report["straightened"], relaxed = layout.straighten_quad_islands(obj, charts)
         anchors = report["solver"].pop("anchors", [])
-        aligned = [charts[i] for i in layout.align_to_grid(obj, charts, anchors=anchors)]
-        report["grid_aligned"] = len(aligned)
-        layout.scale_by_visibility(obj, charts, vis, min_scale=opts.min_hidden_scale)
+        uv_layer = bmesh.from_edit_mesh(me).loops.layers.uv.active
+        unpacked = layout._snapshot(bmesh.from_edit_mesh(me).faces, uv_layer)
 
-        bm = bmesh.from_edit_mesh(me)
-        for f in bm.faces:
-            f.select = True
-        bmesh.update_edit_mesh(me)
-        # grid-aligned shells keep their rotation (pinned); the packer may
-        # still turn irregular shells to fit tighter
-        layout.set_pinned(obj, aligned, True)
-        try:
-            bpy.ops.uv.pack_islands(rotate=True, rotate_method='AXIS_ALIGNED', scale=True,
-                                    margin_method='FRACTION', margin=opts.margin,
-                                    shape_method='CONCAVE', pin=True, pin_method='ROTATION')
-        finally:
-            layout.set_pinned(obj, aligned, False)
+        def finish():
+            aligned = [charts[i] for i in layout.align_to_grid(obj, charts, anchors=anchors)]
+            layout.scale_by_visibility(obj, charts, vis, min_scale=opts.min_hidden_scale)
+            # grid-aligned shells keep their rotation (pinned); the packer
+            # may still turn irregular shells to fit tighter
+            coverage = layout.pack(obj, charts, aligned, margin=opts.margin)[0]
+            return coverage, len(aligned)
+
+        coverage, report["grid_aligned"] = finish()
+        if relaxed:
+            # a band straightened at some angle cost can turn into a strip
+            # too long to pack well (a lamp's conical side is 13:1): keep the
+            # straight strips only if they cost at most 10 % of the coverage
+            bm = bmesh.from_edit_mesh(me)
+            bm.faces.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.active
+            straight = layout._snapshot(bm.faces, uv_layer)
+            layout._restore(bm.faces, uv_layer, unpacked)
+            for ci, snap in relaxed.items():
+                layout._restore([bm.faces[i] for i in charts[ci]], uv_layer, snap)
+            bmesh.update_edit_mesh(me)
+            curved_cov, curved_aligned = finish()
+            if coverage >= 0.9 * curved_cov:
+                bm = bmesh.from_edit_mesh(me)
+                layout._restore(bm.faces, bm.loops.layers.uv.active, straight)
+                bmesh.update_edit_mesh(me)
+            else:
+                report["straightened"] -= len(relaxed)
+                report["grid_aligned"] = curved_aligned
 
         bm = bmesh.from_edit_mesh(me)
         report.update(metrics.analyze(bm, bm.loops.layers.uv.active, vis))
