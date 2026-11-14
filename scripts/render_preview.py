@@ -3,7 +3,8 @@ red, from two angles (front-top and below), plus the UV layout.
 
     blender -b <file.blend> --factory-startup --python scripts/render_preview.py -- <object> <out_prefix>
 
-Writes <out_prefix>_top.png, <out_prefix>_bottom.png and <out_prefix>_uv.png.
+Writes <out_prefix>_top.png, <out_prefix>_bottom.png, <out_prefix>_checker.png and
+<out_prefix>_uv.png. Relative paths are resolved against the current directory.
 """
 
 import colorsys
@@ -18,6 +19,11 @@ from mathutils import Vector
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from smart_seams.core import metrics  # noqa: E402
+
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+from script_util import UsageError, mesh_object, out_path, run, script_args  # noqa: E402
+
+USAGE = "blender -b <file.blend> --factory-startup --python scripts/render_preview.py -- <object> <out_prefix>"
 
 
 def island_colors(ob):
@@ -84,9 +90,14 @@ def look_at(cam, target, direction, dist):
 
 
 def main():
-    argv = sys.argv[sys.argv.index("--") + 1:]
-    name, prefix = argv[0], argv[1]
-    ob = bpy.data.objects[name]
+    argv = script_args()
+    if len(argv) != 2:
+        raise UsageError(f"expected <object> <out_prefix>, got {argv}")
+    name = argv[0]
+    prefix = out_path(argv[1])
+    ob = mesh_object(name)
+    if not ob.data.uv_layers:
+        raise UsageError(f"object {name!r} has no UV map to preview")
     if ob.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
     for o in list(bpy.data.objects):
@@ -131,7 +142,8 @@ def main():
     img = bpy.data.images.new("checker", 1024, 1024)
     img.generated_type = 'COLOR_GRID'
     mat = bpy.data.materials.new("checker")
-    mat.use_nodes = True
+    if bpy.app.version < (5, 0, 0):  # always on (and deprecated) from 5.0
+        mat.use_nodes = True
     nt = mat.node_tree
     tex = nt.nodes.new("ShaderNodeTexImage")
     tex.image = img
@@ -155,7 +167,7 @@ def main():
     bpy.ops.uv.export_layout(filepath=f"{prefix}_uv.png", mode='PNG', size=(900, 900), opacity=0.6,
                              check_existing=False)
     bpy.ops.object.mode_set(mode='OBJECT')
-    print("PREVIEW", name, "islands", n)
+    print("PREVIEW", name, "islands", n, "->", prefix + "_*.png")
 
 
-main()
+run(main, USAGE)
