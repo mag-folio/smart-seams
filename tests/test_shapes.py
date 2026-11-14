@@ -33,15 +33,7 @@ from smart_seams.core import metrics, pipeline  # noqa: E402
 from smart_seams.core.blender_validator import TMP_NAME  # noqa: E402
 
 # shape -> what was measured when the failure was recorded (see module docstring)
-KNOWN_FAILURES = {
-    "suzanne": "12 shells > Max Shells 10 (solver: 20 shells at 0.08, 15 at 0.12, 12 at the 0.2 "
-               "ceiling); worst stretch 0.1753, overlap 0, flipped 0. The hard shell limit is "
-               "not enforced when merges still fail at the stretch ceiling.",
-    "l_extrusion_rot": "3 shells, while the identical L prism with a different cap corner order "
-                       "(l_extrusion) gets 1. BlenderValidator._measure fan-triangulates n-gons "
-                       "from corner 0, so a concave cap whose fan leaves the polygon looks "
-                       "folded and every merge with it is refused.",
-}
+KNOWN_FAILURES = {}
 
 # the same geometry built with a different vertex order must give the same shell count
 SAME_AS = {"l_extrusion_rot": "l_extrusion"}

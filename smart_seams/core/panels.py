@@ -27,7 +27,8 @@ same way:
 
 import math
 
-from .seams import loop_smoothed_costs, tube_ring_cuts
+from .seams import (bevel_crease_edges, complete_feature_lines, loop_smoothed_costs,
+                    tube_ring_cuts)
 
 
 class PanelSettings:
@@ -75,6 +76,13 @@ class PanelSolver:
         bm, s = self.bm, self.s
         panel_of = [None] * len(bm.faces)
         panels = []
+        self.creases = bevel_crease_edges(bm, s.panel_angle, self.angle)
+        self.stats["bevel_creases"] = len(self.creases)
+        strong = {e.index for e in bm.edges
+                  if len(e.link_faces) == 2 and self.angle[e.index] >= s.panel_angle} | self.creases
+        ext = complete_feature_lines(bm, strong, self.angle, 0.5 * s.panel_angle)
+        self.creases |= ext
+        self.stats["line_completions"] = len(ext)
         for f in bm.faces:
             if panel_of[f.index] is not None:
                 continue
@@ -85,7 +93,8 @@ class PanelSolver:
             while stack:
                 g = stack.pop()
                 for e in g.edges:
-                    if len(e.link_faces) != 2 or self.angle[e.index] >= s.panel_angle:
+                    if (len(e.link_faces) != 2 or self.angle[e.index] >= s.panel_angle
+                            or e.index in self.creases):
                         continue
                     for h in e.link_faces:
                         if panel_of[h.index] is None:
@@ -177,6 +186,61 @@ class PanelSolver:
         runs.sort(key=lambda r: -sum(bm.edges[k].calc_length() for k in r))
         return runs
 
+    def _shortest_cut(self, idx, src, dst):
+        """Cheapest path of glued inner edges of face set ``idx`` from a vertex
+        in ``src`` to one in ``dst`` (edge indices, or [] if none)."""
+        import heapq
+        fset = set(idx)
+        adj = {}
+        for fi in idx:
+            for e in self.bm.faces[fi].edges:
+                if self.glued[e.index] and all(g.index in fset for g in e.link_faces):
+                    a, b = e.verts[0].index, e.verts[1].index
+                    w = self.cost[e.index] + 1e-6
+                    adj.setdefault(a, set()).add((b, w, e.index))
+                    adj.setdefault(b, set()).add((a, w, e.index))
+        dist = {v: 0.0 for v in src}
+        heap = [(0.0, v) for v in src]
+        heapq.heapify(heap)
+        prev = {}
+        while heap:
+            d, v = heapq.heappop(heap)
+            if d > dist.get(v, 1e30):
+                continue
+            if v in dst:
+                path = []
+                while v in prev:
+                    v, ei = prev[v]
+                    path.append(ei)
+                return path
+            for w, c, ei in adj.get(v, ()):
+                if d + c < dist.get(w, 1e30):
+                    dist[w] = d + c
+                    prev[w] = (v, ei)
+                    heapq.heappush(heap, (d + c, w))
+        return []
+
+    def _ordered_path(self, edge_ids):
+        """Edges of a simple path or loop in walking order (None if branched)."""
+        bm = self.bm
+        by_vert = {}
+        for ei in edge_ids:
+            for v in bm.edges[ei].verts:
+                by_vert.setdefault(v.index, []).append(ei)
+        if any(len(xs) > 2 for xs in by_vert.values()):
+            return None
+        ends = [vi for vi, xs in by_vert.items() if len(xs) == 1]
+        cur = ends[0] if ends else bm.edges[edge_ids[0]].verts[0].index
+        order, used = [], set()
+        while True:
+            nxt = [ei for ei in by_vert[cur] if ei not in used]
+            if not nxt:
+                break
+            used.add(nxt[0])
+            order.append(nxt[0])
+            cur = bm.edges[nxt[0]].other_vert(bm.verts[cur]).index
+        return order if len(order) == len(edge_ids) else None
+
     def _faces(self, idx):
         return [self.bm.faces[i] for i in idx]
 
@@ -258,8 +322,16 @@ class PanelSolver:
             path.append(ei)
         return path
 
-    def _split(self, idx):
-        """Split a face set in two along its dominant normal direction."""
+    def _split(self, idx, limit):
+        """Split a face set that cannot flatten in two.
+
+        Two candidate partitions are tried: a crease-following watershed
+        between the faces at either end of the panel's normal spread, and the
+        plain split by the sign of the normal along that spread. The one that
+        leaves more of the area flattening within ``limit`` wins; on a tie, the
+        one whose cut runs less over smooth edges. Returns ``(parts, oks)``
+        with the flatten result of each part, so it is not validated twice.
+        """
         from mathutils import Vector
         faces = self._faces(idx)
         n = [f.normal for f in faces]
@@ -274,20 +346,68 @@ class PanelSolver:
             if acc.length < 1e-12:
                 break
             axis = acc.normalized()
-        a = [f.index for f in faces if (f.normal - mean).dot(axis) >= 0]
-        b = [f.index for f in faces if (f.normal - mean).dot(axis) < 0]
-        if not a or not b:
+        proj = {f.index: (f.normal - mean).dot(axis) for f in faces}
+        cands = [self._watershed(idx, max(proj, key=proj.get), min(proj, key=proj.get)),
+                 ([fi for fi in idx if proj[fi] >= 0], [fi for fi in idx if proj[fi] < 0])]
+        cands = [c for c in cands if c[0] and c[1]]
+        if not cands:
             # fall back to a spatial split
             cs = [f.calc_center_median() for f in faces]
             c = sum(cs, Vector()) / len(cs)
             ext = [max(p[k] for p in cs) - min(p[k] for p in cs) for k in range(3)]
             k = ext.index(max(ext))
-            a = [f.index for f, p in zip(faces, cs) if p[k] >= c[k]]
-            b = [f.index for f, p in zip(faces, cs) if p[k] < c[k]]
-        out = []
-        for part in (a, b):
-            out.extend(self._components(part))
-        return out
+            cands = [([f.index for f, p in zip(faces, cs) if p[k] >= c[k]],
+                      [f.index for f, p in zip(faces, cs) if p[k] < c[k]])]
+        total = sum(self.area[i] for i in idx) or 1.0
+        best = None
+        for a, b in cands:
+            parts = self._components(a) + self._components(b)
+            owner = {fi: pi for pi, p in enumerate(parts) for fi in p}
+            oks = [self._ok(p, limit) for p in parts]
+            good = sum(self.area[fi] for p, ok in zip(parts, oks) if ok for fi in p) / total
+            soft = 0.0
+            for fi in idx:
+                for e in self.bm.faces[fi].edges:
+                    lf = e.link_faces
+                    if (len(lf) == 2 and lf[0].index in owner and lf[1].index in owner
+                            and owner[lf[0].index] != owner[lf[1].index]):
+                        soft += e.calc_length() * max(0.0, 1.0 - self.angle[e.index] / self.s.panel_angle)
+            key = (-round(good, 6), soft)
+            if best is None or key < best[0]:
+                best = (key, parts, oks)
+        return best[1], best[2]
+
+    def _watershed(self, idx, seed_a, seed_b):
+        """Grow two regions from two seed faces at once; the face goes to
+        whichever front reaches it first. Crossing an edge costs the distance
+        between face centres, steeply more on creased edges, so each front
+        fills its own smooth basin first and the two meet on a crease: the
+        split follows the panel's feature lines instead of an arbitrary
+        normal plane (as in the chart growing of Lévy et al., LSCM 2002)."""
+        import heapq
+        if seed_a == seed_b:
+            return [], []
+        fset = set(idx)
+        ref = 0.25 * self.s.panel_angle
+        centre = {fi: self.bm.faces[fi].calc_center_median() for fi in idx}
+        label = {}
+        heap = [(0.0, seed_a, 0), (0.0, seed_b, 1)]
+        while heap:
+            d, fi, lab = heapq.heappop(heap)
+            if fi in label:
+                continue
+            label[fi] = lab
+            for e in self.bm.faces[fi].edges:
+                if not self.glued[e.index]:
+                    continue
+                for g in e.link_faces:
+                    gi = g.index
+                    if gi in fset and gi not in label:
+                        w = (centre[fi] - centre[gi]).length * (1.0 + (self.angle[e.index] / ref) ** 4)
+                        heapq.heappush(heap, (d + w, gi, lab))
+        a = [fi for fi in idx if label.get(fi) == 0]
+        b = [fi for fi in idx if label.get(fi, 1) == 1]
+        return a, b
 
     def _components(self, idx):
         fset = set(idx)
@@ -326,16 +446,74 @@ class PanelSolver:
                         if a is not None and b is not None and a != b:
                             self.glued[e.index] = False
 
+    def _cone_cuts(self, min_defect_deg=90.0):
+        """Cut every strong cone point (cone or pyramid apex) open to its border.
+
+        An interior vertex whose face angles add up to far less than 360
+        degrees cannot lie flat in any unwrap; Blender's ABF fails on it and
+        falls back to a poor solution. Each such vertex gets the cheapest
+        (least visible) path to its panel's border as a seam, the cut an
+        artist would make down the back of a cone.
+        """
+        import heapq
+        bm = self.bm
+        cuts = 0
+        panel_of = {fi: pid for pid, idx in enumerate(self.panels) for fi in idx}
+        for v in bm.verts:
+            if not v.link_faces or any(len(e.link_faces) != 2 for e in v.link_edges):
+                continue
+            pids = {panel_of[f.index] for f in v.link_faces}
+            if len(pids) != 1 or not all(self.glued[e.index] for e in v.link_edges):
+                continue
+            total = sum(math.degrees(l.calc_angle()) for l in v.link_loops)
+            if 360.0 - total < min_defect_deg:
+                continue
+            fset = set(self.panels[pids.pop()])
+
+            def is_border(x):
+                return any(not self.glued[e.index] or len(e.link_faces) != 2
+                           or any(g.index not in fset for g in e.link_faces)
+                           for e in x.link_edges)
+            dist, prev = {v.index: 0.0}, {}
+            heap = [(0.0, v.index)]
+            end = None
+            while heap:
+                d, vi = heapq.heappop(heap)
+                if d > dist.get(vi, 1e30):
+                    continue
+                x = bm.verts[vi]
+                if vi != v.index and is_border(x):
+                    end = vi
+                    break
+                for e in x.link_edges:
+                    if not self.glued[e.index]:
+                        continue
+                    w = e.other_vert(x).index
+                    nd = d + self.cost[e.index] + 1e-6
+                    if nd < dist.get(w, 1e30):
+                        dist[w] = nd
+                        prev[w] = (vi, e.index)
+                        heapq.heappush(heap, (nd, w))
+            if end is None:
+                continue
+            vi = end
+            while vi in prev:
+                vi, ei = prev[vi]
+                self.glued[ei] = False
+            cuts += 1
+        self.stats["cone_cuts"] = cuts
+
     def make_panels_flat(self):
         """Ensure every panel flattens within the base stretch limit."""
         limit = self.s.stretch_steps[0]
+        self._cone_cuts()
         ring_cuts = tube_ring_cuts(self.bm, self.cost)
         out = []
-        work = [(p, 0) for p in self.panels]
+        work = [(p, 0, False) for p in self.panels]
         cuts = splits = 0
         while work:
-            idx, depth = work.pop()
-            if len(idx) <= 1 or self._ok(idx, limit):
+            idx, depth, known_ok = work.pop()
+            if known_ok or len(idx) <= 1 or self._ok(idx, limit):
                 out.append(idx)
                 continue
             path = self._cut_path(idx, ring_cuts)
@@ -351,10 +529,10 @@ class PanelSolver:
             if depth >= self.s.max_split_depth:
                 out.append(idx)
                 continue
-            parts = self._split(idx)
+            parts, oks = self._split(idx, limit)
             self._unglue_between(parts)
             splits += 1
-            work.extend((p, depth + 1) for p in parts)
+            work.extend((p, depth + 1, ok) for p, ok in zip(parts, oks))
         self.panels = out
         self.stats.update(tube_cuts=cuts, splits=splits, flat_panels=len(out))
 
@@ -521,18 +699,118 @@ class PanelSolver:
             comps.sort(key=lambda c: -sum(self.bm.edges[i].calc_length() for i in c))
             return comps
 
-        def perimeter(sid):
-            fset = set(shells[sid])
-            per = 0.0
-            for fi in shells[sid]:
-                for e in self.bm.faces[fi].edges:
-                    inside = sum(1 for g in e.link_faces if g.index in fset)
-                    if inside == 1 or not self.glued[e.index]:
-                        per += e.calc_length()
-            return per
+        # (area, perimeter, thinness) per shell; a shell's entry is dropped
+        # when it takes part in a merge (the only time its faces or inner
+        # glue change), so priorities are not recomputed on every pass
+        stats_cache = {}
 
-        def try_merge(a, b, edge_ids, limit):
+        def shell_stats(sid):
+            st = stats_cache.get(sid)
+            if st is None:
+                fset = set(shells[sid])
+                per = 0.0
+                for fi in shells[sid]:
+                    for e in self.bm.faces[fi].edges:
+                        inside = sum(1 for g in e.link_faces if g.index in fset)
+                        if inside == 1 or not self.glued[e.index]:
+                            per += e.calc_length()
+                area = sum(self.area[i] for i in shells[sid])
+                st = stats_cache[sid] = (area, per, area / ((per / 2.0) ** 2 + 1e-12))
+            return st
+
+        def perimeter(sid):
+            return shell_stats(sid)[1]
+
+        def hinges(comps):
+            """Ever shorter contiguous pieces of each border component, centred
+            on its most visible edge: halves, quarters, ... down to one edge.
+            Used only to get under Max Shells: a short hinge joins two shells
+            that cannot flatten glued along their whole border."""
+            out = []
+            for comp in comps:
+                if any(ei in self.hole_edges for ei in comp):
+                    continue
+                order = self._ordered_path(comp)
+                if not order:
+                    continue
+                n = len(order)
+                centre = max(range(n), key=lambda i: self.cost[order[i]])
+                size = n // 2
+                while size >= 1:
+                    lo = min(max(0, centre - size // 2), n - size)
+                    piece = order[lo:lo + size]
+                    if piece not in out:
+                        out.append(piece)
+                    size //= 2
+            return out
+
+        def relief_cuts(a, b, comps):
+            """A cap that sits in a ring's hole (a pupil in an eyeball, a
+            patch enclosed by its neighbour) cannot join the ring on a partial
+            hinge: the free borders would cross. Cut the ring once instead,
+            on the cheapest path from the shared border to its other boundary
+            loop, the way a side band is opened for its caps."""
+            out = []
+            for comp in comps:
+                cverts = {v.index for ei in comp for v in self.bm.edges[ei].verts}
+                for x in (a, b):
+                    loops = self._boundary_loops(shells[x])
+                    others = [lp for lp in loops if not (lp & cverts)]
+                    if not others:
+                        continue
+                    path = self._shortest_cut(shells[x], cverts, set().union(*others))
+                    if path:
+                        out.append(path)
+            return out
+
+        def darts(a, b, edge_ids, limit, max_darts=3):
+            """Glue the whole border and relieve the stretch with darts: cuts
+            from the shell's border to the inner vertex where most curvature
+            is concentrated (largest angle defect), up to ``max_darts``."""
+            union = shells[a] + shells[b]
+            fset = set(union)
+            for ei in edge_ids:
+                self.glued[ei] = True
+            made = []
+            for _ in range(max_darts):
+                border, inner = set(), []
+                for fi in union:
+                    for v in self.bm.faces[fi].verts:
+                        if all(self.glued[e.index] and len(e.link_faces) == 2
+                               and all(g.index in fset for g in e.link_faces)
+                               for e in v.link_edges):
+                            inner.append(v)
+                        else:
+                            border.add(v.index)
+                if not inner or not border:
+                    break
+                v = max(set(inner), key=lambda x: abs(
+                    360.0 - sum(math.degrees(l.calc_angle()) for l in x.link_loops)))
+                path = self._shortest_cut(union, {v.index}, border)
+                if not path:
+                    break
+                for ei in path:
+                    self.glued[ei] = False
+                made.extend(path)
+                if attempt(a, b, [[]], limit):
+                    return True
+            for ei in made:
+                self.glued[ei] = True
+            for ei in edge_ids:
+                self.glued[ei] = False
+            return False
+
+        def try_merge(a, b, edge_ids, limit, hinge=False):
             comps = components(edge_ids)
+            if hinge:
+                for cut in relief_cuts(a, b, comps):
+                    for ei in cut:
+                        self.glued[ei] = False
+                    if attempt(a, b, [edge_ids] + comps, limit):
+                        return True
+                    for ei in cut:
+                        self.glued[ei] = True
+                return attempt(a, b, hinges(comps), limit) or darts(a, b, edge_ids, limit)
             options = [edge_ids] if len(comps) > 1 else []
             options += comps
             # unfold along one straight edge run (a box face folding open),
@@ -558,6 +836,9 @@ class PanelSolver:
                            for k in run for g in self.bm.edges[k].link_faces)
             runs.sort(key=lambda r: (not on_anchor(r), -sum(self.cost[k] for k in r)))
             options += runs
+            return attempt(a, b, options, limit)
+
+        def attempt(a, b, options, limit):
             for glue in options:
                 for ei in glue:
                     self.glued[ei] = True
@@ -567,6 +848,8 @@ class PanelSolver:
                     for fi in shells[b]:
                         shell_of[fi] = a
                     shells[a].extend(shells.pop(b))
+                    stats_cache.pop(a, None)
+                    stats_cache.pop(b, None)
                     return True
                 for ei in glue:
                     self.glued[ei] = False
@@ -581,11 +864,10 @@ class PanelSolver:
             rest, across the most visible borders first, so the seams that
             survive are the hidden ones.
             """
-            area_a = sum(self.area[i] for i in shells[a])
-            area_b = sum(self.area[i] for i in shells[b])
+            area_a, area_b = shell_stats(a)[0], shell_stats(b)[0]
             small = a if area_a <= area_b else b
             area = min(area_a, area_b)
-            thin = self._thinness(shells[small])
+            thin = shell_stats(small)[2]
             shared = sum(self.bm.edges[i].calc_length() for i in edge_ids)
             if area / total < 0.01 or thin < s.thin_ratio:
                 return (0, -shared / (perimeter(small) + 1e-12))
@@ -618,6 +900,37 @@ class PanelSolver:
                 if not merged:
                     break
             self.stats[f"shells_at_{limit}"] = len(shells)
+
+        # Max Shells is a hard limit. If merges glued along whole borders
+        # still fail at the stretch ceiling, join neighbours on a shorter
+        # hinge (part of their border, down to one edge) instead. Every such
+        # merge is still validated at the ceiling, so overlap, flips and
+        # stretch past the ceiling are never traded for it; the price is
+        # longer seams. Only if no hinge passes for any pair do the shells
+        # stay above the limit (reported as ``max_shells_unmet``).
+        ceiling = s.stretch_steps[-1]
+        hinged = 0
+        while len(shells) > s.max_shells:
+            cands = []
+            for a in list(shells):
+                for b, eids in borders(a).items():
+                    if a < b:
+                        key = (a, b, len(shells[a]), len(shells[b]), "hinge")
+                        if key not in refused:
+                            cands.append((priority(a, b, eids), a, b, eids, key))
+            cands.sort(key=lambda c: c[0])
+            merged = False
+            for _p, a, b, eids, key in cands:
+                if try_merge(a, b, eids, ceiling, hinge=True):
+                    merged = True
+                    hinged += 1
+                    break
+                refused.add(key)
+            if not merged:
+                break
+        self.stats["hinge_merges"] = hinged
+        if len(shells) > s.max_shells:
+            self.stats["max_shells_unmet"] = True
         self.shells = list(shells.values())
         self.stats["shells"] = len(self.shells)
 

@@ -150,6 +150,172 @@ def tube_ring_cuts(bm, cost, min_turn_deg=270.0):
     return forced
 
 
+def _opposite(e, f):
+    for l in f.loops:
+        if l.edge is e:
+            return l.link_loop_next.link_loop_next.edge
+    return None
+
+
+def _strip_width(e, f):
+    """Width of quad ``f`` measured across ``e`` (distance to the opposite edge)."""
+    o = _opposite(e, f)
+    mean = 0.5 * (e.calc_length() + o.calc_length())
+    return f.calc_area() / mean if mean > 1e-12 else 0.0
+
+
+def bevel_crease_edges(bm, panel_angle, angles=None, min_angle=None, ratio=3.0, max_faces=8):
+    """Corner lines of rounded (bevelled) edges.
+
+    A bevel turns a sharp corner into a narrow strip of faces whose edges each
+    bend by only part of the corner angle, so no single edge reaches
+    ``panel_angle`` and panels would flood straight round the corner. Here a
+    *bevel band* is found from a creased seed edge (>= ``min_angle``) by
+    walking across narrow quads on both sides until a face at least
+    ``ratio`` times wider (or a non-quad / open border); the crossed edges
+    form the band, which counts if its total turn reaches ``panel_angle``. Closed rings (cylinder walls, hole walls) are never
+    bands. Each band contributes one edge, its sharpest, as the corner line;
+    the choice is made per edge loop so a long bevel gets one straight line
+    instead of switching between its parallel edges.
+    """
+    if angles is None:
+        angles = [math.degrees(e.calc_face_angle(0.0)) if len(e.link_faces) == 2 else 180.0
+                  for e in bm.edges]
+    if min_angle is None:
+        min_angle = 0.25 * panel_angle
+
+    def creased(e):
+        return len(e.link_faces) == 2 and min_angle <= angles[e.index] < panel_angle
+
+    def side(seed, f, ref):
+        """Walk across narrow quads away from ``seed`` until a much wider
+        face (the flank). Returns the crossed edges, or None if the strip
+        closes into a ring or never reaches a flank."""
+        edges, widths = [], []
+        cur, face = seed, f
+        for _ in range(max_faces):
+            if len(face.verts) != 4:
+                return edges                      # junction: accept as flank
+            w = _strip_width(cur, face)
+            if w > ratio * max(widths + [ref]):
+                return edges                      # wide flank face
+            nxt = _opposite(cur, face)
+            if nxt is seed:
+                return None                       # closed ring: a tube, not a bevel
+            if len(nxt.link_faces) != 2:
+                return edges                      # open border
+            edges.append(nxt)
+            widths.append(w)
+            cur = nxt
+            face = nxt.link_faces[0] if nxt.link_faces[1] is face else nxt.link_faces[1]
+        return None
+
+    bands = []
+    seen = set()
+    for e in bm.edges:
+        if e.index in seen or not creased(e):
+            continue
+        f0, f1 = e.link_faces
+        if len(f0.verts) != 4 and len(f1.verts) != 4:
+            continue
+        ws = [_strip_width(e, f) for f in (f0, f1) if len(f.verts) == 4]
+        ref = min(ws)
+        if ref <= 1e-12:
+            continue
+        a = side(e, f0, ref)
+        b = side(e, f1, ref)
+        if a is None or b is None:
+            continue
+        band = list(reversed(a)) + [e] + b
+        if len(band) < 2:
+            continue
+        seen.update(x.index for x in band if creased(x))
+        # an edge of the band that is already sharp enough is the corner line
+        if max(angles[x.index] for x in band) >= panel_angle:
+            continue
+        if sum(angles[x.index] for x in band) < panel_angle:
+            continue
+        bands.append([x.index for x in band])
+
+    if not bands:
+        return set()
+    loop_of = edge_loops(bm)
+    tot, cnt = {}, {}
+    for band in bands:
+        for ei in band:
+            lid = loop_of[ei]
+            tot[lid] = tot.get(lid, 0.0) + angles[ei]
+            cnt[lid] = cnt.get(lid, 0) + 1
+    out = set()
+    for band in bands:
+        mid = 0.5 * (len(band) - 1)
+        best = max(range(len(band)), key=lambda i: (
+            round(tot[loop_of[band[i]]] / cnt[loop_of[band[i]]], 1),
+            angles[band[i]], -abs(i - mid)))
+        out.add(band[best])
+    return out
+
+
+def complete_feature_lines(bm, strong, angles, low, min_dot=0.85, max_gap=4):
+    """Close short gaps in feature lines (hysteresis, as in Canny).
+
+    A corner line is often a little softer at its ends (a foot, where two
+    bevels meet) and dips under the panel angle for an edge or two. Such a
+    gap lets the panel flood leak round the corner, so the whole line stops
+    being a border. From each loose end of a feature line, walk on along the
+    straightest next edge while it still bends by at least ``low`` degrees,
+    for at most ``max_gap`` edges. The walk is kept only if it reaches
+    another feature line or an open border, i.e. it actually closes a gap;
+    a line that just fades out on a smooth surface is left alone.
+    Returns the added edge indices.
+    """
+    def on_border(v, skip):
+        return any(x.index != skip and (x.index in strong or len(x.link_faces) != 2)
+                   for x in v.link_edges)
+
+    def straightest(e, v):
+        d = v.co - e.other_vert(v).co
+        if d.length < 1e-12:
+            return None
+        d.normalize()
+        best, best_dot = None, min_dot
+        for x in v.link_edges:
+            if x is e:
+                continue
+            dx = x.other_vert(v).co - v.co
+            if dx.length < 1e-12:
+                continue
+            dot = d.dot(dx.normalized())
+            if dot > best_dot:
+                best, best_dot = x, dot
+        return best
+
+    added = set()
+    for ei in strong:
+        e = bm.edges[ei]
+        for v in e.verts:
+            # loose end: no other feature edge or border at this vertex
+            if on_border(v, ei):
+                continue
+            chain, cur, at = [], e, v
+            for _ in range(max_gap):
+                nxt = straightest(cur, at)
+                if (nxt is None or nxt.index in strong or len(nxt.link_faces) != 2
+                        or angles[nxt.index] < low):
+                    chain = None
+                    break
+                chain.append(nxt.index)
+                at = nxt.other_vert(at)
+                cur = nxt
+                if on_border(at, nxt.index):
+                    break
+            else:
+                chain = None
+            if chain:
+                added.update(chain)
+    return added
+
+
 def loop_smoothed_costs(bm, visibility, settings):
     """Seam cost per edge, blended with the mean cost of its edge loop.
 
