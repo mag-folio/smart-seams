@@ -355,6 +355,101 @@ class PanelSolver:
         self.panels = out
         self.stats.update(tube_cuts=cuts, splits=splits, flat_panels=len(out))
 
+    # ------------------------------------------------------------- side bands
+    def _panel_normal(self, idx):
+        from mathutils import Vector
+        n = sum((self.bm.faces[i].normal * self.area[i] for i in idx), Vector())
+        return n.normalized() if n.length > 1e-12 else None
+
+    def join_side_bands(self, axes=None, max_tilt=0.35, min_turn_deg=270.0):
+        """Join a ring of side panels into one continuous strip.
+
+        The four sides of a box (or the facets of a prism, bevel bands
+        included) are treated like one tube panel: they are glued into a
+        single strip and cut open once, on the least visible border between
+        two of them. The caps are attached later by ``merge_shells``. This
+        gives the artist's T / band-plus-caps layout, where a texture flows
+        round the sides with a single vertical seam, instead of a zig-zag
+        that leaves seams on several visible vertical edges.
+        """
+        from mathutils import Vector
+        axes = axes or (Vector((0, 0, 1)), Vector((1, 0, 0)), Vector((0, 1, 0)))
+        limit = self.s.stretch_steps[0]
+        panel_of = {}
+        for pid, idx in enumerate(self.panels):
+            for fi in idx:
+                panel_of[fi] = pid
+        normals = [self._panel_normal(idx) for idx in self.panels]
+        used = set()
+        bands = 0
+        for axis in axes:
+            side = {pid for pid, n in enumerate(normals)
+                    if pid not in used and n is not None and abs(n.dot(axis)) < max_tilt}
+            # borders between side panels that run along the axis
+            border = {}
+            for e in self.bm.edges:
+                lf = e.link_faces
+                if len(lf) != 2 or self.glued[e.index]:
+                    continue
+                a, b = panel_of[lf[0].index], panel_of[lf[1].index]
+                if a == b or a not in side or b not in side:
+                    continue
+                d = e.verts[1].co - e.verts[0].co
+                if d.length < 1e-12 or abs(d.normalized().dot(axis)) < 0.7:
+                    continue
+                border.setdefault((min(a, b), max(a, b)), []).append(e.index)
+            nbrs = {}
+            for a, b in border:
+                nbrs.setdefault(a, []).append(b)
+                nbrs.setdefault(b, []).append(a)
+            seen = set()
+            for start in nbrs:
+                if start in seen:
+                    continue
+                # connected component; a band is a simple cycle (degree 2)
+                comp, stack = {start}, [start]
+                while stack:
+                    for q in nbrs[stack.pop()]:
+                        if q not in comp:
+                            comp.add(q)
+                            stack.append(q)
+                seen |= comp
+                if len(comp) < 3 or any(len(nbrs[p]) != 2 for p in comp):
+                    continue
+                # walk the cycle and check it really wraps round the axis
+                order = [start, nbrs[start][0]]
+                while len(order) < len(comp):
+                    a, b = nbrs[order[-1]]
+                    order.append(a if a != order[-2] else b)
+                turn = 0.0
+                for i, p in enumerate(order):
+                    q = order[(i + 1) % len(order)]
+                    turn += math.degrees(normals[p].angle(normals[q], 0.0))
+                if turn < min_turn_deg:
+                    continue
+                pairs = [(min(p, q), max(p, q)) for p, q in
+                         ((order[i], order[(i + 1) % len(order)]) for i in range(len(order)))]
+                if any(k not in border for k in pairs):
+                    continue
+                # cut on the least visible border, glue the others
+                cut = min(pairs, key=lambda k: sum(self.cost[i] for i in border[k]))
+                glue = [ei for k in pairs if k != cut for ei in border[k]]
+                for ei in glue:
+                    self.glued[ei] = True
+                strip = [fi for p in order for fi in self.panels[p]]
+                if not self._ok(strip, limit):
+                    for ei in glue:
+                        self.glued[ei] = False
+                    continue
+                used |= comp
+                bands += 1
+                self.log.append(f"side band: {len(order)} panels round {tuple(axis)}")
+        if used:
+            # one panel per band (glue-connected faces of the joined panels)
+            joined = self._components([fi for p in sorted(used) for fi in self.panels[p]])
+            self.panels = [idx for p, idx in enumerate(self.panels) if p not in used] + joined
+        self.stats["side_bands"] = bands
+
     # ------------------------------------------------------------------ shells
     def _thinness(self, idx):
         area = sum(self.area[i] for i in idx)
@@ -427,7 +522,11 @@ class PanelSolver:
             # unfold along one straight edge run (a box face folding open),
             # never along part of a hole rim, and only if the run is a real
             # share of the smaller shell's border (no one-edge flaps)
+            # A cap attached this way keeps its other borders as seams, so try
+            # the most visible run first: the seams that remain are the
+            # hidden ones (a lid hinges on its front edge, not its back).
             min_len = 0.2 * min(perimeter(a), perimeter(b))
+            runs = []
             for comp in comps:
                 if any(ei in self.hole_edges for ei in comp):
                     continue
@@ -435,7 +534,9 @@ class PanelSolver:
                     if len(run) == len(comp):
                         continue
                     if sum(self.bm.edges[k].calc_length() for k in run) >= min_len:
-                        options.append(run)
+                        runs.append(run)
+            runs.sort(key=lambda r: -sum(self.cost[k] for k in r))
+            options += runs
             for glue in options:
                 for ei in glue:
                     self.glued[ei] = True
@@ -531,6 +632,7 @@ def compute_shells(bm, visibility, settings=None, validator=None):
     solver = PanelSolver(bm, visibility, settings, validator or numpy_validator())
     solver.build_panels()
     solver.make_panels_flat()
+    solver.join_side_bands()
     solver.merge_shells()
     LAST_STATS.clear()
     LAST_STATS.update(solver.stats)

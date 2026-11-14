@@ -113,15 +113,23 @@ def unwrap(obj, opts=None):
                           correct_aspect=True, margin=0.0)
         if opts.straighten:
             report["straightened"] = layout.straighten_quad_islands(obj, charts)
+        aligned = [charts[i] for i in layout.align_to_grid(obj, charts)]
+        report["grid_aligned"] = len(aligned)
         layout.scale_by_visibility(obj, charts, vis, min_scale=opts.min_hidden_scale)
 
         bm = bmesh.from_edit_mesh(me)
         for f in bm.faces:
             f.select = True
         bmesh.update_edit_mesh(me)
-        bpy.ops.uv.pack_islands(rotate=True, rotate_method='AXIS_ALIGNED', scale=True,
-                                margin_method='FRACTION', margin=opts.margin,
-                                shape_method='CONCAVE')
+        # grid-aligned shells keep their rotation (pinned); the packer may
+        # still turn irregular shells to fit tighter
+        layout.set_pinned(obj, aligned, True)
+        try:
+            bpy.ops.uv.pack_islands(rotate=True, rotate_method='AXIS_ALIGNED', scale=True,
+                                    margin_method='FRACTION', margin=opts.margin,
+                                    shape_method='CONCAVE', pin=True, pin_method='ROTATION')
+        finally:
+            layout.set_pinned(obj, aligned, False)
 
         bm = bmesh.from_edit_mesh(me)
         report.update(metrics.analyze(bm, bm.loops.layers.uv.active, vis))

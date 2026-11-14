@@ -140,6 +140,76 @@ def straighten_quad_islands(obj, charts, max_stretch=0.12):
     return straightened
 
 
+def align_to_grid(obj, charts, min_agreement=0.9):
+    """Turn grid-shaped shells so their edges line up with the UV grid.
+
+    The rotation is the length-weighted mean edge direction (modulo 90°).
+    It is applied only when the edges clearly agree on one grid (box sides,
+    straight strips); irregular shells are left for the packer to rotate.
+    Shells with vertical walls are then turned in 90° steps so the object's
+    up direction points up in UV, so a side band lies as a horizontal strip
+    with its caps above and below it (the T layout).
+
+    Returns the indices of the aligned charts (pin them while packing).
+    """
+    me = obj.data
+    bm = bmesh.from_edit_mesh(me)
+    bm.faces.ensure_lookup_table()
+    uv_layer = bm.loops.layers.uv.active
+    aligned = []
+    for ci, faces_idx in enumerate(charts):
+        faces = [bm.faces[i] for i in faces_idx]
+        loops = [l for f in faces for l in f.loops]
+        sx = sy = total = 0.0
+        for l in loops:
+            d = l.link_loop_next[uv_layer].uv - l[uv_layer].uv
+            w = d.length
+            if w < 1e-12:
+                continue
+            a = 4.0 * math.atan2(d.y, d.x)
+            sx += w * math.cos(a)
+            sy += w * math.sin(a)
+            total += w
+        if total <= 0 or math.hypot(sx, sy) < min_agreement * total:
+            continue
+        aligned.append(ci)
+        rot = -math.atan2(sy, sx) / 4.0
+        # which way does 3D "up" run in UV after that rotation?
+        ux = uy = 0.0
+        c, s = math.cos(rot), math.sin(rot)
+        for l in loops:
+            d = l.link_loop_next[uv_layer].uv - l[uv_layer].uv
+            dz = l.link_loop_next.vert.co.z - l.vert.co.z
+            ux += (c * d.x - s * d.y) * dz
+            uy += (s * d.x + c * d.y) * dz
+        if ux * ux + uy * uy > 1e-12:
+            quarter = round(math.atan2(uy, ux) / (math.pi / 2))  # 1 = already up
+            rot += (1 - quarter) * math.pi / 2
+        if abs(math.remainder(rot, 2 * math.pi)) < 1e-6:
+            continue
+        cx = sum(l[uv_layer].uv.x for l in loops) / len(loops)
+        cy = sum(l[uv_layer].uv.y for l in loops) / len(loops)
+        c, s = math.cos(rot), math.sin(rot)
+        for l in loops:
+            x, y = l[uv_layer].uv.x - cx, l[uv_layer].uv.y - cy
+            l[uv_layer].uv = (cx + c * x - s * y, cy + s * x + c * y)
+    bmesh.update_edit_mesh(me)
+    return aligned
+
+
+def set_pinned(obj, charts, pinned):
+    """Pin or unpin every UV of the given charts."""
+    me = obj.data
+    bm = bmesh.from_edit_mesh(me)
+    bm.faces.ensure_lookup_table()
+    uv_layer = bm.loops.layers.uv.active
+    for faces_idx in charts:
+        for fi in faces_idx:
+            for l in bm.faces[fi].loops:
+                l[uv_layer].pin_uv = pinned
+    bmesh.update_edit_mesh(me)
+
+
 def scale_by_visibility(obj, charts, visibility, min_scale=0.5, matrix_world=None):
     """Uniform texel density, then shrink rarely-seen islands.
 

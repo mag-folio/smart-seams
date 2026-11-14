@@ -23,7 +23,7 @@ Built because Blender's *Smart UV Project* and Substance Painter's auto-unwrap t
 |---|---|---|
 | ![](docs/images/cube_after_checker.png) | ![](docs/images/cylinder_after_checker.png) | ![](docs/images/lamp_base_after_checker.png) |
 | ![](docs/images/cube_after_uv.png) | ![](docs/images/cylinder_after_uv.png) | ![](docs/images/lamp_base_after_uv.png) |
-| 1 shell (the classic cross) | 3 shells (wall + 2 caps) | 4 shells: top with holes, bottom, side band, triangle recess |
+| 1 shell: the four sides as one strip, caps above and below | 3 shells (wall + 2 caps) | 4 shells: top with holes, bottom, side band, triangle recess |
 
 ## Results
 
@@ -34,7 +34,7 @@ Measured by [`scripts/run_test.py`](scripts/run_test.py) on the test scene (`tes
 | Cube | Smart Seams | **1** | 0 % | 0.00 | 0.0° | 0 | 7 edges |
 | Cylinder | Smart Seams | **3** | 0 % | 0.00 | 0.0° | 0 | |
 | Lamp base | hand-made reference | 3 | 2.4 % | 9.63 | 31.0° | 82 | 5.6 |
-| Lamp base | Smart Seams | 4 | **0 %** | **0.06** | **0.1°** | **0** | 6.3 |
+| Lamp base | Smart Seams | 4 | **0 %** | **0.06** | **0.1°** | **0** | 6.6 |
 | Table | previous auto-unwrap | 19 | 17.4 % | 1.05 | 1.8° | 200 | 58.6 |
 | Table | Smart Seams | **10** | **0 %** | **0.10** | 5.6° | **0** | **49.5** |
 
@@ -63,19 +63,25 @@ shell. The solver ([`core/panels.py`](smart_seams/core/panels.py)) works the sam
    visible column, so the cut is one straight seam instead of a staircase.
 4. **Splitting.** A panel that still cannot flatten without stretching is split along its
    dominant normal direction, recursively.
-5. **Shells.** Panels are merged into shells. Tiny and thin panels (bevel bands, small trims) go
+5. **Side bands.** A ring of side panels (the four sides of a box, the facets of a prism, a
+   recess wall) is treated like one tube panel: it is joined into a single strip and cut once,
+   on the least visible vertical border. A texture then flows round the sides with one seam,
+   and the caps attach to the strip (band plus caps, the way an artist lays out a box).
+6. **Shells.** Panels are merged into shells. Tiny and thin panels (bevel bands, small trims) go
    first, onto the neighbour they share the longest border with, so they lie flat instead of
    becoming skinny strips. After that, merges happen across the most visible borders first, so
-   the surviving seams are the hidden ones. A box face may also fold open along one straight
-   edge (cube → one shell), but hole rims are always cut all the way round or not at all.
-6. **Validation with Blender's own unwrapper.** Every candidate merge is unwrapped on a hidden
+   the surviving seams are the hidden ones. A cap folds open along one straight edge, the most
+   visible one, so its remaining borders are the hidden seams. Hole rims are always cut all the
+   way round or not at all.
+7. **Validation with Blender's own unwrapper.** Every candidate merge is unwrapped on a hidden
    temporary mesh with the same solver the final unwrap uses. It is refused if any face flips,
    if the UV boundary crosses itself (overlap), or if stretch exceeds the current limit. The limit
    starts strict (0.08) and is relaxed step by step, up to the *Stretch Ceiling*, only while the
    object is still above *Max Shells*.
-7. **Layout.** Final unwrap; all-quad strips are straightened with *Follow Active Quads* when that
+8. **Layout.** Final unwrap; all-quad strips are straightened with *Follow Active Quads* when that
    adds no stretch or overlap; shells are normalised to equal texel density, then scaled by
-   visibility (*Hidden Shell Scale*); finally they are packed.
+   visibility (*Hidden Shell Scale*). Grid-shaped shells are turned to line up with the UV grid,
+   with the object's up direction pointing up, and keep that rotation while packing.
 
 Related reading: Sheffer & Hart, *Seamster: Inconspicuous Low-Distortion Texture Seam Layout*
 (2002); Lévy et al., *Least Squares Conformal Maps* (2002); Garland et al., *Hierarchical Face
