@@ -76,6 +76,7 @@ def solve_seams(obj, opts):
     with BlenderValidator(method=opts.unwrap_method) as validator:
         chart_of_face, seams = panels_mod.compute_shells(bm, vis, settings, validator)
     stats = dict(panels_mod.LAST_STATS)
+    stats["anchors"] = [list(a) for a in panels_mod.LAST_ANCHORS]
     bm.free()
 
     _ensure_edit_mode(obj)
@@ -113,7 +114,8 @@ def unwrap(obj, opts=None):
                           correct_aspect=True, margin=0.0)
         if opts.straighten:
             report["straightened"] = layout.straighten_quad_islands(obj, charts)
-        aligned = [charts[i] for i in layout.align_to_grid(obj, charts)]
+        anchors = report["solver"].pop("anchors", [])
+        aligned = [charts[i] for i in layout.align_to_grid(obj, charts, anchors=anchors)]
         report["grid_aligned"] = len(aligned)
         layout.scale_by_visibility(obj, charts, vis, min_scale=opts.min_hidden_scale)
 

@@ -140,15 +140,19 @@ def straighten_quad_islands(obj, charts, max_stretch=0.12):
     return straightened
 
 
-def align_to_grid(obj, charts, min_agreement=0.9):
+def align_to_grid(obj, charts, min_agreement=0.9, anchors=()):
     """Turn grid-shaped shells so their edges line up with the UV grid.
 
     The rotation is the length-weighted mean edge direction (modulo 90°).
     It is applied only when the edges clearly agree on one grid (box sides,
     straight strips); irregular shells are left for the packer to rotate.
     Shells with vertical walls are then turned in 90° steps so the object's
-    up direction points up in UV, so a side band lies as a horizontal strip
-    with its caps above and below it (the T layout).
+    up direction points up in UV.
+
+    A shell holding a side strip (``anchors``: the faces of the strip's end
+    panel, which carries both caps) is turned a further quarter so the strip
+    runs vertically, with the end panel and its two caps at the bottom
+    (the upside-down T).
 
     Returns the indices of the aligned charts (pin them while packing).
     """
@@ -185,6 +189,15 @@ def align_to_grid(obj, charts, min_agreement=0.9):
         if ux * ux + uy * uy > 1e-12:
             quarter = round(math.atan2(uy, ux) / (math.pi / 2))  # 1 = already up
             rot += (1 - quarter) * math.pi / 2
+        anchor = next((set(a) for a in anchors if set(a) & set(faces_idx)), None)
+        if anchor:
+            rot += math.pi / 2
+            # anchor panel at the bottom of the strip
+            c, s = math.cos(rot), math.sin(rot)
+            def v_after(ls):
+                return sum(s * l[uv_layer].uv.x + c * l[uv_layer].uv.y for l in ls) / len(ls)
+            if v_after([l for f in faces if f.index in anchor for l in f.loops]) > v_after(loops):
+                rot += math.pi
         if abs(math.remainder(rot, 2 * math.pi)) < 1e-6:
             continue
         cx = sum(l[uv_layer].uv.x for l in loops) / len(loops)

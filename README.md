@@ -23,7 +23,7 @@ Built because Blender's *Smart UV Project* and Substance Painter's auto-unwrap t
 |---|---|---|
 | ![](docs/images/cube_after_checker.png) | ![](docs/images/cylinder_after_checker.png) | ![](docs/images/lamp_base_after_checker.png) |
 | ![](docs/images/cube_after_uv.png) | ![](docs/images/cylinder_after_uv.png) | ![](docs/images/lamp_base_after_uv.png) |
-| 1 shell: the four sides as one strip, caps above and below | 3 shells (wall + 2 caps) | 4 shells: top with holes, bottom, side band, triangle recess |
+| 1 shell: the four sides as one vertical strip, both caps at its foot | 3 shells (wall + 2 caps) | 4 shells: top with holes, bottom, side band, triangle recess |
 
 ## Results
 
@@ -66,7 +66,8 @@ shell. The solver ([`core/panels.py`](smart_seams/core/panels.py)) works the sam
 5. **Side bands.** A ring of side panels (the four sides of a box, the facets of a prism, a
    recess wall) is treated like one tube panel: it is joined into a single strip and cut once,
    on the least visible vertical border. A texture then flows round the sides with one seam,
-   and the caps attach to the strip (band plus caps, the way an artist lays out a box).
+   and both caps attach to the panel at one end of the strip (band plus caps, the way an artist
+   lays out a box).
 6. **Shells.** Panels are merged into shells. Tiny and thin panels (bevel bands, small trims) go
    first, onto the neighbour they share the longest border with, so they lie flat instead of
    becoming skinny strips. After that, merges happen across the most visible borders first, so
@@ -81,7 +82,9 @@ shell. The solver ([`core/panels.py`](smart_seams/core/panels.py)) works the sam
 8. **Layout.** Final unwrap; all-quad strips are straightened with *Follow Active Quads* when that
    adds no stretch or overlap; shells are normalised to equal texel density, then scaled by
    visibility (*Hidden Shell Scale*). Grid-shaped shells are turned to line up with the UV grid,
-   with the object's up direction pointing up, and keep that rotation while packing.
+   with the object's up direction pointing up, and keep that rotation while packing. A box shell
+   is stood upright: the side strip runs vertically with the two caps either side of its bottom
+   square (an upside-down T).
 
 Related reading: Sheffer & Hart, *Seamster: Inconspicuous Low-Distortion Texture Seam Layout*
 (2002); Lévy et al., *Least Squares Conformal Maps* (2002); Garland et al., *Hierarchical Face

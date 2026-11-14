@@ -66,6 +66,9 @@ class PanelSolver:
         self.glued = [False] * len(bm.edges)
         self.stats = {}
         self.log = []
+        # faces of the panel at one end of each side strip: both caps
+        # attach to it, so the shell is a strip with the caps at its foot
+        self.anchors = []
 
     # ------------------------------------------------------------------ panels
     def build_panels(self):
@@ -443,6 +446,19 @@ class PanelSolver:
                     continue
                 used |= comp
                 bands += 1
+                # the strip's two end panels sit either side of the cut; the
+                # caps go on the more visible one, so their remaining seams
+                # (the other panels' rims) are the more hidden ones
+                ends = [p for p in order if any(k == cut for k in
+                        ((min(p, q), max(p, q)) for q in nbrs[p]))]
+                def rim_cost(p):
+                    fset = set(self.panels[p])
+                    return sum(self.cost[e.index] for fi in self.panels[p]
+                               for e in self.bm.faces[fi].edges
+                               if e.index not in border.get(cut, ())
+                               and any(g.index not in fset for g in e.link_faces)
+                               and abs((e.verts[1].co - e.verts[0].co).normalized().dot(axis)) < 0.7)
+                self.anchors.append(set(self.panels[max(ends, key=rim_cost)]))
                 self.log.append(f"side band: {len(order)} panels round {tuple(axis)}")
         if used:
             # one panel per band (glue-connected faces of the joined panels)
@@ -535,7 +551,12 @@ class PanelSolver:
                         continue
                     if sum(self.bm.edges[k].calc_length() for k in run) >= min_len:
                         runs.append(run)
-            runs.sort(key=lambda r: -sum(self.cost[k] for k in r))
+            # a cap goes on the strip's end panel first (both caps on the
+            # same panel), then on the most visible run
+            def on_anchor(run):
+                return any(g.index in anc for anc in self.anchors
+                           for k in run for g in self.bm.edges[k].link_faces)
+            runs.sort(key=lambda r: (not on_anchor(r), -sum(self.cost[k] for k in r)))
             options += runs
             for glue in options:
                 for ei in glue:
@@ -623,6 +644,7 @@ def numpy_validator():
 
 
 LAST_STATS = {}
+LAST_ANCHORS = []
 
 
 def compute_shells(bm, visibility, settings=None, validator=None):
@@ -636,4 +658,5 @@ def compute_shells(bm, visibility, settings=None, validator=None):
     solver.merge_shells()
     LAST_STATS.clear()
     LAST_STATS.update(solver.stats)
+    LAST_ANCHORS[:] = [sorted(a) for a in solver.anchors]
     return solver.result()
