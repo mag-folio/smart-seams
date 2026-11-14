@@ -13,6 +13,19 @@ Built because Blender's *Smart UV Project* and Substance Painter's auto-unwrap t
 - make no attempt to hide seams,
 - shatter one object into many tiny shells.
 
+### Hand-made UVs vs Smart Seams (video)
+
+[![Lamp base: hand-made UVs on the left, Smart Seams on the right, coloured by a stretch heat map](docs/images/lamp_base_compare_video.png)](docs/videos/lamp_base_handmade_vs_smart_seams.mp4)
+
+▶ **[Watch the 14-second comparison](docs/videos/lamp_base_handmade_vs_smart_seams.mp4)**: the lamp
+base's original hand-made UVs (left) next to Smart Seams on the same mesh (right). It shows a checker
+texture (even, square tiles mean no stretch), then a stretch heat map (blue = none, red = 2.7× or more
+in any direction, magenta = flipped), then both UV layouts. Worst shell stretch drops from 9.63 to
+0.06 and flipped faces from 82 to 0. Much of the hand-made score comes from faces on the top that
+have collapsed to zero area in the UVs. Smart Seams isn't perfect either: the inside of the small hole
+on top still shows some stretch (yellow). Rebuild it with
+[`scripts/render_comparison_video.py`](scripts/render_comparison_video.py).
+
 | | Original UVs (table) | Smart Seams (table) |
 |---|---|---|
 | Shells on model (seams in red) | ![](docs/images/table_before_top.png) | ![](docs/images/table_after_top.png) |
@@ -136,7 +149,7 @@ smart_seams/                 the add-on (Blender extension)
   core/layout.py             straightening, visibility-weighted texel density
   core/pipeline.py           end-to-end pipeline
   core/metrics.py            UV quality metrics
-scripts/                     headless tests, preview renderer, scene builder
+scripts/                     headless tests, preview and comparison video renderers, scene builder
 tests/                       metric unit tests, procedural shape tests
 test_data/                   test meshes (table, lamp base, cube, cylinder)
 ```
@@ -150,6 +163,7 @@ blender -b test_data/uv_test.blend --factory-startup --python scripts/test_addon
 blender -b test_data/uv_test.blend --factory-startup --python scripts/test_robustness.py
 blender -b test_data/uv_test.blend --factory-startup --python scripts/run_test.py -- preview/out.blend
 blender -b preview/out.blend --factory-startup --python scripts/render_preview.py -- table preview/table
+blender -b test_data/uv_test.blend --factory-startup --python scripts/render_comparison_video.py -- preview/video
 ```
 
 `test_addon.py` registers the add-on, runs it on every test object, and fails if any object
