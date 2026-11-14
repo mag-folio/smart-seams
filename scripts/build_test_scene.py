@@ -19,6 +19,9 @@ from mathutils import Vector
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from clean_save import save_clean  # noqa: E402
+from script_util import UsageError, run, script_args  # noqa: E402
+
+USAGE = "blender -b --factory-startup --python scripts/build_test_scene.py -- <scene.obj> <out_dir>"
 
 OBJECTS = {
     "table_square.001": "table",
@@ -27,12 +30,19 @@ OBJECTS = {
 
 
 def main():
-    argv = sys.argv[sys.argv.index("--") + 1:]
-    src, out_dir = argv[0], argv[1]
+    argv = script_args()
+    if len(argv) != 2:
+        raise UsageError(f"expected <scene.obj> <out_dir>, got {argv}")
+    src, out_dir = (os.path.abspath(a) for a in argv)
+    if not os.path.isfile(src):
+        raise UsageError(f"scene OBJ not found: {src}")
     os.makedirs(out_dir, exist_ok=True)
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.wm.obj_import(filepath=src)
+    missing = [n for n in OBJECTS if n not in bpy.data.objects]
+    if missing:
+        raise UsageError(f"{src} has no object(s) {', '.join(missing)}")
     for ob in list(bpy.data.objects):
         if ob.name not in OBJECTS:
             bpy.data.objects.remove(ob, do_unlink=True)
@@ -74,4 +84,4 @@ def main():
     save_clean(os.path.join(out_dir, "uv_test.blend"))
 
 
-main()
+run(main, USAGE)

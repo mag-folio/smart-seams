@@ -19,6 +19,9 @@ from smart_seams.core import pipeline  # noqa: E402
 
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 from clean_save import save_clean  # noqa: E402
+from script_util import UsageError, out_path, run, script_args  # noqa: E402
+
+USAGE = "blender -b <file.blend> --factory-startup --python scripts/run_test.py -- [out.blend] [key=value ...]"
 
 
 def parse(v):
@@ -31,10 +34,17 @@ def parse(v):
 
 
 def main():
-    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-    out = next((a for a in argv if a.endswith(".blend")), None)
+    argv = script_args()
     kw = dict(a.split("=", 1) for a in argv if "=" in a)
-    opts = pipeline.Options(**{k: parse(v) for k, v in kw.items()})
+    paths = [a for a in argv if "=" not in a]
+    if len(paths) > 1 or (paths and not paths[0].endswith(".blend")):
+        raise UsageError(f"expected at most one output .blend, got {paths}")
+    out = out_path(paths[0]) if paths else None
+    try:
+        opts = pipeline.Options(**{k: parse(v) for k, v in kw.items()})
+    except AttributeError as e:
+        names = sorted(vars(pipeline.Options()))
+        raise UsageError(f"unknown option {e}; options: {', '.join(names)}") from None
 
     results = {}
     for ob in [o for o in bpy.data.objects if o.type == 'MESH']:
@@ -51,7 +61,8 @@ def main():
         print("  after ", json.dumps(after))
     if out:
         save_clean(out)
+        print("SAVED", out)
     return results
 
 
-main()
+run(main, USAGE)
