@@ -24,6 +24,11 @@ from mathutils import Euler, Vector  # noqa: E402
 import smart_seams  # noqa: E402
 from smart_seams.core import blender_validator  # noqa: E402
 
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+from script_util import run as run_script  # noqa: E402
+
+USAGE = "blender -b test_data/uv_test.blend --factory-startup --python scripts/test_robustness.py"
+
 FAILS = []
 CASES = []
 
@@ -567,9 +572,7 @@ def main():
     print(f"ROBUST {len(CASES) - len(FAILS)}/{len(CASES)} passed in {time.perf_counter() - t_all:.1f} s"
           f" on Blender {bpy.app.version_string}")
     if FAILS:
-        print("ROBUST FAILED:", ", ".join(FAILS))
-        sys.stdout.flush()
-        os._exit(1)
+        raise AssertionError("ROBUST FAILED: " + ", ".join(FAILS))
 
 
-main()
+run_script(main, USAGE)

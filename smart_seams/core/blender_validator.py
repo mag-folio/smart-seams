@@ -19,7 +19,7 @@ import bmesh
 import bpy
 import numpy as np
 
-from .flatten import boundary_crossings
+from .flatten import boundary_crossings, face_triangles
 
 TMP_NAME = "__smart_seams_validator__"
 
@@ -47,7 +47,37 @@ def cleanup():
     for me in [m for m in bpy.data.meshes if _is_tmp(m) and m.users == 0]:
         bpy.data.meshes.remove(me)
         removed += 1
+    if removed:
+        try:
+            bpy.context.view_layer.update()  # drop stale (None) object entries
+        except (RuntimeError, AttributeError):
+            pass
     return removed
+
+
+def _triangles(f, loops):
+    """Corner triangles of a face for measuring.
+
+    Convex faces keep the plain fan from corner 0 (the established
+    measurement). A fan over a concave n-gon has triangles outside the face
+    with reversed orientation, which would look folded and make every merge
+    with that face fail, so those faces use a proper triangulation.
+
+    Quads keep the fan even when concave: Blender's unwrapper splits a quad
+    along its own diagonal, and measuring a concave quad with the 3D
+    triangulation instead refuses merges the fan accepts (the test table,
+    which has 25 strongly concave quads, goes from 10 to 13 shells).
+    """
+    n = len(loops)
+    fan = [(0, i, i + 1) for i in range(1, n - 1)]
+    if n > 4:
+        f.normal_update()  # faces of the temporary mesh have no normal yet
+        nrm = f.normal
+        p0 = loops[0].vert.co
+        for _a, b, c in fan:
+            if (loops[b].vert.co - p0).cross(loops[c].vert.co - p0).dot(nrm) < -1e-12:
+                return face_triangles(f)
+    return fan
 
 
 class BlenderValidator:
@@ -98,6 +128,12 @@ class BlenderValidator:
                 pass
             self.obj = None
         cleanup()
+        # removing objects through bpy.data can leave stale (None) entries in
+        # view_layer.objects until the layer is refreshed
+        try:
+            ctx.view_layer.update()
+        except RuntimeError:
+            pass
         for o in self._prev_selected:
             try:
                 o.select_set(True)
@@ -206,12 +242,12 @@ class BlenderValidator:
                     key_id[k] = len(uv_pts)
                     uv_pts.append((uv.x, uv.y))
                 ids.append(key_id[k])
-            for i in range(1, len(loops) - 1):
-                p0, p1, p2 = loops[0].vert.co, loops[i].vert.co, loops[i + 1].vert.co
+            for i0, i1, i2 in _triangles(f, loops):
+                p0, p1, p2 = loops[i0].vert.co, loops[i1].vert.co, loops[i2].vert.co
                 a = (p1 - p0).cross(p2 - p0).length * 0.5
                 if a <= 1e-14:
                     continue
-                tris.append((ids[0], ids[i], ids[i + 1]))
+                tris.append((ids[i0], ids[i1], ids[i2]))
                 area3.append(a)
         if not tris:
             return False, math.inf, None, None
