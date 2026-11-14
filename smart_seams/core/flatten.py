@@ -46,6 +46,32 @@ def _wedges(faces, glued):
     return corner_id, next_id
 
 
+def face_triangles(f):
+    """Corner-index triangles of a face, valid for concave n-gons.
+
+    A plain fan from corner 0 is only correct for convex faces: for a concave
+    quad or n-gon some fan triangles lie outside the face with reversed
+    orientation, which LSCM then tries to flip, so a perfectly flat chart is
+    reported as distorted and folded.
+    """
+    n = len(f.loops)
+    if n == 3:
+        return [(0, 1, 2)]
+    from mathutils.geometry import tessellate_polygon
+    co = [l.vert.co.copy() for l in f.loops]
+    tris = tessellate_polygon([co])
+    if len(tris) != n - 2:  # tessellation failed (degenerate polygon): fall back to a fan
+        return [(0, i, i + 1) for i in range(1, n - 1)]
+    out = []
+    nrm = f.normal if f.normal.length > 0 else None
+    for a, b, c in tris:
+        # tessellate_polygon does not promise the face's winding: match it
+        if nrm is not None and (co[b] - co[a]).cross(co[c] - co[a]).dot(nrm) < 0:
+            b, c = c, b
+        out.append((a, b, c))
+    return out
+
+
 def flatten(faces, glued):
     """Return (uv array [n,2], triangles [(ids), area3d]) or None on failure."""
     corner_id, n = _wedges(faces, glued)
@@ -57,8 +83,8 @@ def flatten(faces, glued):
         ids = [corner_id[(l.vert.index, f.index)] for l in f.loops]
         for l in f.loops:
             pos3[corner_id[(l.vert.index, f.index)]] = l.vert.co
-        for i in range(1, len(ids) - 1):
-            tris.append((ids[0], ids[i], ids[i + 1]))
+        for a, b, c in face_triangles(f):
+            tris.append((ids[a], ids[b], ids[c]))
     T = np.array(tris)
     p0, p1, p2 = pos3[T[:, 0]], pos3[T[:, 1]], pos3[T[:, 2]]
     e1 = p1 - p0
@@ -158,9 +184,14 @@ def boundary_crossings(uv, T):
         # cross(d_i, pts_j - p_i) for all i, j
         rel = pts[None, :, :] - a_idx_p[:, None, :]
         return a_d[:, None, 0] * rel[:, :, 1] - a_d[:, None, 1] * rel[:, :, 0]
-    o1 = orient(p, d, p)   # side of p_j w.r.t. segment i
-    o2 = orient(p, d, q)   # side of q_j w.r.t. segment i
-    tol = span * span * 1e-7
+    # side of p_j / q_j w.r.t. segment i, as a signed distance (dividing by
+    # |d_i| makes the tolerance a distance; a fixed span^2 tolerance on the raw
+    # cross product let short boundary segments cross unnoticed)
+    ln = np.hypot(d[:, 0], d[:, 1])
+    ln[ln == 0] = np.inf  # zero-length segments never straddle anything
+    o1 = orient(p, d, p) / ln[:, None]
+    o2 = orient(p, d, q) / ln[:, None]
+    tol = span * 1e-6
     # segment j strictly straddles line i (touching / collinear doesn't count)
     cross_i = ((o1 > tol) & (o2 < -tol)) | ((o1 < -tol) & (o2 > tol))
     cross = cross_i & cross_i.T
