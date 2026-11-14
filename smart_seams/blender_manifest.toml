@@ -7,8 +7,21 @@ tagline = "Clean, artist-style UV seams that hide and don't stretch"
 maintainer = "Smart Seams contributors"
 type = "add-on"
 
+website = "https://github.com/mag-folio/smart-seams"
+
 tags = ["UV", "Mesh"]
 
+# Tested on 4.5 LTS and 5.0; uses only APIs available since 4.2.
 blender_version_min = "4.2.0"
 
 license = ["SPDX:GPL-3.0-or-later"]
+
+# No permissions needed: the add-on works only on the open .blend file.
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  "/.git/",
+  "/*.zip",
+]
