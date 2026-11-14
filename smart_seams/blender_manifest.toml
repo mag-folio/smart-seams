@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "smart_seams"
+version = "0.1.0"
+name = "Smart Seams"
+tagline = "Clean, artist-style UV seams that hide and don't stretch"
+maintainer = "Smart Seams contributors"
+type = "add-on"
+
+tags = ["UV", "Mesh"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
