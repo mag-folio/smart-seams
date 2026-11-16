@@ -95,7 +95,24 @@ def solve_seams(obj, opts):
 
 
 def unwrap(obj, opts=None):
-    """Run the whole pipeline on ``obj``. Returns a report dict."""
+    """Run the whole pipeline on ``obj``. Returns a report dict.
+
+    UV sync selection is switched on while it runs (and put back after). With
+    it off, Blender's UV operators only act on *UV-selected* elements, and
+    files where nothing is UV-selected got shells that the packer silently
+    left where they were, on top of each other. With sync on, the face
+    selection the pipeline sets is what every operator uses.
+    """
+    ts = bpy.context.scene.tool_settings
+    prev_sync = ts.use_uv_select_sync
+    ts.use_uv_select_sync = True
+    try:
+        return _unwrap(obj, opts)
+    finally:
+        ts.use_uv_select_sync = prev_sync
+
+
+def _unwrap(obj, opts=None):
     opts = opts or Options()
     t0 = time.perf_counter()
     prev_mode = obj.mode

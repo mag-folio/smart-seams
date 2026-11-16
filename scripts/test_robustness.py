@@ -490,6 +490,43 @@ def other_modes():
 
 
 @case
+def uv_sync_off_still_packs():
+    """With UV sync selection off and nothing UV-selected, Blender's packer
+    used to leave the shells where they were (outside 0..1, stacked on top
+    of each other). Shells must be packed, and the setting put back."""
+    me = bpy.data.meshes.new("rb_sync")
+    bm = bmesh.new()
+    for x in (0.0, 3.0, 6.0):                    # three loose parts = three shells
+        geom = bmesh.ops.create_cube(bm, size=1.0)
+        bmesh.ops.translate(bm, vec=Vector((x, -26, 0)), verts=geom["verts"])
+    uvl = bm.loops.layers.uv.verify()
+    for f in bm.faces:
+        for l in f.loops:
+            l[uvl].uv = (5.0, 5.0)               # junk UVs far outside the square
+            if hasattr(l[uvl], "select"):        # Blender 4.x: per-UV selection
+                l[uvl].select = False
+                l[uvl].select_edge = False
+    bm.to_mesh(me)
+    bm.free()
+    ob = bpy.data.objects.new("rb_sync", me)
+    scene().collection.objects.link(ob)
+    ts = scene().tool_settings
+    prev = ts.use_uv_select_sync
+    try:
+        ts.use_uv_select_sync = False
+        select([ob], ob)
+        run("smart_seams_unwrap")
+        r = report()["rb_sync"]
+        assert ts.use_uv_select_sync is False, "UV sync selection setting not restored"
+        assert uv_bounds_ok(ob), "UVs left outside the 0..1 square (packer did nothing)"
+        assert r.get("uv_overlap_pct", 0) == 0, f"shells overlap: {r.get('uv_overlap_pct')}%"
+        assert r.get("uv_boundary_crossings", 0) == 0, r
+    finally:
+        ts.use_uv_select_sync = prev
+        remove(ob)
+
+
+@case
 def mark_reports_overwritten_seams():
     ob = grid_box("rb_seams", loc=(0, -22, 0))
     try:

@@ -17,7 +17,7 @@ import random
 import bmesh
 import bpy
 
-from . import metrics
+from . import keepalive, metrics
 
 
 def _island_stretch(faces, uv_layer):
@@ -113,6 +113,7 @@ def _faces_overlap(faces, uv_layer):
                 grid.setdefault((gx, gy), []).append(k)
     tested = set()
     for members in grid.values():
+        keepalive.pulse()
         for i in range(len(members)):
             for j in range(i + 1, len(members)):
                 a, b = members[i], members[j]
@@ -223,6 +224,7 @@ def straighten_quad_islands(obj, charts, max_stretch=0.12, max_area=0.1,
         snap = _snapshot(faces, uv_layer)
         best = None
         for active_idx in [f.index for f in _active_candidates(faces, tries)]:
+            keepalive.pulse()
             bm = bmesh.from_edit_mesh(me)
             bm.faces.ensure_lookup_table()
             uv_layer = bm.loops.layers.uv.active
@@ -396,6 +398,30 @@ PACK_VARIANTS = (
 )
 
 
+def _spread_charts(bm, uv_layer, charts):
+    """Lay the shells out in a row with gaps between them.
+
+    The final unwrap packs shells edge to edge, so a vertex on a seam can end
+    up at exactly the same UV spot in both shells. Blender's packer then sees
+    the two shells as one island and never pulls them apart, which left
+    shells stacked on top of each other. Separated shells can't be joined.
+    """
+    bm.faces.ensure_lookup_table()
+    boxes = []
+    for c in charts:
+        xs = [l[uv_layer].uv.x for fi in c for l in bm.faces[fi].loops]
+        ys = [l[uv_layer].uv.y for fi in c for l in bm.faces[fi].loops]
+        boxes.append((min(xs), min(ys), max(xs), max(ys)) if xs else (0, 0, 0, 0))
+    gap = 0.1 * max([max(b[2] - b[0], b[3] - b[1]) for b in boxes] + [1e-3])
+    x = 0.0
+    for c, (x0, y0, x1, y1) in zip(charts, boxes):
+        dx, dy = x - x0, -y0
+        for fi in c:
+            for l in bm.faces[fi].loops:
+                l[uv_layer].uv = (l[uv_layer].uv.x + dx, l[uv_layer].uv.y + dy)
+        x += (x1 - x0) + gap
+
+
 def _uv_area_total(bm, uv_layer):
     return sum(abs(metrics._uv_area(f, uv_layer)) for f in bm.faces)
 
@@ -416,9 +442,71 @@ def _rasterize(tris, pad):
     pixel units, min corner at 0): every pixel the triangles touch is set.
 
     Pixel centres inside a triangle are set, plus every pixel an edge passes
-    through (edges are sampled at half-pixel steps), then grown by one pixel:
+    through (edges sampled at quarter-pixel steps), then grown by one pixel:
     any point of a triangle lies within one pixel of a set pixel.
+
+    Same tests as ``_rasterize_reference`` (the exact same centre test, and
+    every edge sample point it uses plus one between each pair), so the mask
+    contains everything the original marked. It is computed for all
+    triangles at once in numpy (grouped by box size and edge length), which
+    is what keeps dense meshes fast.
     """
+    import numpy as np
+    tris = np.asarray(tris, dtype=float)
+    w = int(math.ceil(tris[..., 0].max())) + 2 * pad + 2
+    h = int(math.ceil(tris[..., 1].max())) + 2 * pad + 2
+    grid = np.zeros((h, w), dtype=bool)
+    t = tris + pad
+    ax, ay = t[:, 0, 0], t[:, 0, 1]
+    bx, by = t[:, 1, 0], t[:, 1, 1]
+    cx, cy = t[:, 2, 0], t[:, 2, 1]
+
+    # interiors: pixel-centre test over each box, boxes grouped by size
+    x0 = np.minimum(np.minimum(ax, bx), cx).astype(int)
+    x1 = np.ceil(np.maximum(np.maximum(ax, bx), cx)).astype(int)
+    y0 = np.minimum(np.minimum(ay, by), cy).astype(int)
+    y1 = np.ceil(np.maximum(np.maximum(ay, by), cy)).astype(int)
+    den = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+    live = np.abs(den) > 1e-12
+    bw = x1 - x0 + 1
+    bh = y1 - y0 + 1
+    kw = 1 << np.ceil(np.log2(np.maximum(bw, 1))).astype(int)
+    kh = 1 << np.ceil(np.log2(np.maximum(bh, 1))).astype(int)
+    for gw, gh in set(zip(kw[live].tolist(), kh[live].tolist())):
+        idx = np.nonzero(live & (kw == gw) & (kh == gh))[0]
+        ox, oy = np.meshgrid(np.arange(gw), np.arange(gh))
+        ox, oy = ox.ravel()[None, :], oy.ravel()[None, :]
+        chunk = max(1, 4_000_000 // (gw * gh))
+        for s0 in range(0, len(idx), chunk):
+            k = idx[s0:s0 + chunk]
+            px = x0[k][:, None] + ox
+            py = y0[k][:, None] + oy
+            fx, fy = px + 0.5, py + 0.5
+            Ax, Ay, Bx, By, Cx, Cy = (v[k][:, None] for v in (ax, ay, bx, by, cx, cy))
+            D = den[k][:, None]
+            w1 = ((By - Cy) * (fx - Cx) + (Cx - Bx) * (fy - Cy)) / D
+            w2 = ((Cy - Ay) * (fx - Cx) + (Ax - Cx) * (fy - Cy)) / D
+            m = ((w1 >= 0) & (w2 >= 0) & (w1 + w2 <= 1)
+                 & (ox < bw[k][:, None]) & (oy < bh[k][:, None]))
+            grid[py[m], px[m]] = True
+
+    # edges: the original's sample points (n per edge) and one between each pair
+    for (sx, sy), (ex, ey) in (((ax, ay), (bx, by)), ((bx, by), (cx, cy)), ((cx, cy), (ax, ay))):
+        n = (np.hypot(ex - sx, ey - sy) * 2).astype(int) + 2
+        for nv in np.unique(n):
+            k = np.nonzero(n == nv)[0]
+            st = np.linspace(0.0, 1.0, 2 * (nv - 1) + 1)[None, :]
+            chunk = max(1, 4_000_000 // st.shape[1])
+            for s0 in range(0, len(k), chunk):
+                kk = k[s0:s0 + chunk]
+                X = (sx[kk][:, None] + (ex[kk] - sx[kk])[:, None] * st).astype(int)
+                Y = (sy[kk][:, None] + (ey[kk] - sy[kk])[:, None] * st).astype(int)
+                grid[Y.ravel(), X.ravel()] = True
+    return _dilate(grid, 1)
+
+
+def _rasterize_reference(tris, pad):
+    """The original per-triangle rasteriser, kept to test ``_rasterize`` against."""
     import numpy as np
     w = int(math.ceil(tris[..., 0].max())) + 2 * pad + 2
     h = int(math.ceil(tris[..., 1].max())) + 2 * pad + 2
@@ -546,9 +634,11 @@ def raster_pack(islands, margin, coverage_floor, res=300, steps=6, n_angles=16,
         occ = np.zeros((size, size), dtype=float)
         placed = [None] * len(islands)
         for i in order:
+            keepalive.pulse()
             occ_f = np.fft.rfft2(occ)
             best = None
             for a, lo, raw in cands[i]:
+                keepalive.pulse()
                 m = _dilate(raw, k)
                 ys, xs = np.nonzero(m)
                 j0, j1, i0, i1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
@@ -657,6 +747,7 @@ def pack(obj, charts, pinned_charts=(), margin=0.01, variants=PACK_VARIANTS, sta
         for f in bm.faces:
             for l in f.loops:
                 l[uv_layer].uv = l[uv_layer].uv * s
+    _spread_charts(bm, uv_layer, charts)
     snap = _snapshot(bm.faces, uv_layer)
     bmesh.update_edit_mesh(me)
     pinned_faces = {fi for c in pinned_charts for fi in c}
@@ -677,6 +768,7 @@ def pack(obj, charts, pinned_charts=(), margin=0.01, variants=PACK_VARIANTS, sta
         return _snapshot(bm.faces, uv)
 
     def run(start, shape, rot, m):
+        keepalive.pulse()
         bm = bmesh.from_edit_mesh(me)
         bm.faces.ensure_lookup_table()
         _restore(bm.faces, bm.loops.layers.uv.active, start)
@@ -693,6 +785,7 @@ def pack(obj, charts, pinned_charts=(), margin=0.01, variants=PACK_VARIANTS, sta
 
     margin = margin * 0.5  # per island side
     best = None
+    candidates = []
     # final linear scale = sqrt(coverage); the margin scales with it
     m = margin / math.sqrt(0.5)
     for k in range(starts if free else 1):
@@ -712,12 +805,26 @@ def pack(obj, charts, pinned_charts=(), margin=0.01, variants=PACK_VARIANTS, sta
                 cov = run(start, shape, rot, m)
                 if m * math.sqrt(cov) < margin * 0.97:
                     continue
-            if best is None or cov > best[0] + 1e-9:
-                bm = bmesh.from_edit_mesh(me)
-                best = (cov, shape, rot, _snapshot(bm.faces, bm.loops.layers.uv.active))
+            bm = bmesh.from_edit_mesh(me)
+            candidates.append((cov, shape, rot, _snapshot(bm.faces, bm.loops.layers.uv.active)))
+    # Best coverage that really has no overlapping shells (Blender's packer
+    # can't separate shells it thinks are joined, and reports that as a
+    # near perfect fit).
+    for cand in sorted(candidates, key=lambda c: -c[0]):
+        bm = bmesh.from_edit_mesh(me)
+        bm.faces.ensure_lookup_table()
+        uv = bm.loops.layers.uv.active
+        _restore(bm.faces, uv, cand[3])
+        inside = all(-1e-4 <= l[uv].uv.x <= 1 + 1e-4 and -1e-4 <= l[uv].uv.y <= 1 + 1e-4
+                     for f in bm.faces for l in f.loops)
+        if inside and not _faces_overlap(list(bm.faces), uv):
+            best = cand
+            break
     if best is None:  # calibration never settled: plain run, margin as given
         cov = run(snap, 'CONCAVE', 'AXIS_ALIGNED', margin / math.sqrt(0.5))
         bm = bmesh.from_edit_mesh(me)
+        if _faces_overlap(list(bm.faces), bm.loops.layers.uv.active):
+            cov = 0.05  # overlapping: any clean raster layout beats it
         best = (cov, 'CONCAVE', 'AXIS_ALIGNED', _snapshot(bm.faces, bm.loops.layers.uv.active))
 
     # second opinion: raster packer with free rotation (nests concave shells)

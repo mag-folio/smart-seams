@@ -125,9 +125,80 @@ def tube_ring_cuts(bm, cost, min_turn_deg=270.0):
             lid = loop_of[e.index]
             s, n = score.get(lid, (0.0, 0))
             score[lid] = (s + cost[e.index] / (e.calc_length() or 1e-9), n + 1)
-    forced = set()
-    uncut = list(range(len(rings)))
     ring_loops = [{loop_of[e.index]: e for e in ring} for ring in rings]
+    return _pick_ring_cuts(ring_loops, score)
+
+
+def _pick_ring_cuts(ring_loops, score):
+    """Greedy: cut along the edge loop with the lowest mean cost divided by the
+    number of still-uncut rings it crosses, until every ring is cut.
+
+    ``hits`` (uncut rings per loop) is kept up to date as rings are cut, and
+    the cheapest loop comes from a heap, so a dense mesh with thousands of
+    rings takes moments. (Recounting ``hits`` for every candidate on every
+    pass made a 27k-face mesh take many minutes.) Same choices as
+    ``_pick_ring_cuts_reference``.
+    """
+    import heapq
+    rings_of, first = {}, {}
+    for ri, rl in enumerate(ring_loops):
+        for pos, lid in enumerate(rl):
+            rings_of.setdefault(lid, []).append(ri)
+            first.setdefault(lid, (ri, pos))
+    hits = {lid: len(rs) for lid, rs in rings_of.items()}
+
+    def key(lid):
+        s, n = score[lid]
+        return (s / n) / hits[lid]
+
+    heap = [(key(lid), first[lid], lid) for lid in hits]
+    heapq.heapify(heap)
+    cut = [False] * len(ring_loops)
+    left = len(ring_loops)
+    forced = set()
+    def valid(entry):
+        k, _, lid = entry
+        return hits[lid] > 0 and k == key(lid)
+
+    def first_uncut(lid):
+        """Where the original scan meets ``lid`` first: (ring, position)."""
+        for ri in rings_of[lid]:
+            if not cut[ri]:
+                return ri, list(ring_loops[ri]).index(lid)
+        return (len(ring_loops), 0)
+
+    while left and heap:
+        top = heapq.heappop(heap)
+        if not valid(top):
+            continue                      # stale entry
+        # exact ties: the original takes the one it meets first
+        tied = [top]
+        while heap and heap[0][0] == top[0]:
+            e = heapq.heappop(heap)
+            if valid(e) and all(e[2] != t[2] for t in tied):
+                tied.append(e)
+        if len(tied) > 1:
+            tied.sort(key=lambda e: first_uncut(e[2]))
+            for e in tied[1:]:
+                heapq.heappush(heap, e)
+        lid = tied[0][2]
+        for ri in rings_of[lid]:
+            if cut[ri]:
+                continue
+            cut[ri] = True
+            left -= 1
+            forced.add(ring_loops[ri][lid].index)
+            for other in ring_loops[ri]:
+                hits[other] -= 1
+                if hits[other] > 0:
+                    heapq.heappush(heap, (key(other), first[other], other))
+    return forced
+
+
+def _pick_ring_cuts_reference(ring_loops, score):
+    """The original greedy (recounts every candidate each pass), for tests."""
+    forced = set()
+    uncut = list(range(len(ring_loops)))
     while uncut:
         # cheapest loop among the rungs of any uncut ring; prefer loops that
         # cut many rings at once (stacks)
