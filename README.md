@@ -136,6 +136,7 @@ Select one or more mesh objects, open the sidebar (`N`) › **Smart Seams**, pre
 | Front / Sits on Ground | Visibility cues used to hide seams and shrink hidden shells |
 | Hidden Shell Scale | Texel density of fully hidden shells relative to visible ones |
 | Straighten Strips | Follow Active Quads on quad strips when it adds no stretch or overlap |
+| Time Budget | Seconds per object for merging shells (default 180, 0 = no limit). When it runs out the object keeps the shells it has, all still checked for overlap, flips and stretch; strip straightening and the second packer each get a quarter of it |
 
 ## Development
 
@@ -174,10 +175,12 @@ test scripts exit non-zero on failure.
 
 - Packing efficiency on the table: the layout covers 38 % of the UV square, where the old
   auto-unwrap reached 62 %. The packer is also slow on some small meshes.
-- Dense meshes (5k+ faces): small overlaps were reported and are not yet re-verified, and the
-  solve takes about a minute at 5.6k faces (measured on a real scene: 4.1k faces 46 s, 14.7k
-  faces 98 s, 27k faces over 4 minutes). On Windows the window keeps responding during a long
-  solve (`core/keepalive.py`), but it doesn't redraw until the object is done.
+- Dense meshes: a 4.1k-face mesh takes about 40 s and a 14.7k-face one about a minute (27
+  shells). A 27k-face mesh finishes in a few minutes because of the *Time Budget*, but with
+  hundreds of shells: merging its many small panels is still too slow to finish in the budget.
+  On Windows the window keeps responding during a long solve (`core/keepalive.py`), but it
+  doesn't redraw until the object is done.
+- Simple meshes with several shells spend most of their time in packing, not in the solver.
 - The table's remaining splits come from degenerate corner slivers.
 - Symmetry-aware seams (mirror seam placement on symmetric meshes).
 - Batch mode for whole collections.

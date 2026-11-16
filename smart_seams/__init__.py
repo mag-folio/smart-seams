@@ -85,6 +85,12 @@ class SMARTSEAMS_PG_settings(bpy.types.PropertyGroup):
         description="Blender unwrapper used both to test candidate shells and for the final unwrap")
     margin: FloatProperty(name="Margin", default=0.01, min=0.0, max=0.2, soft_max=0.05, precision=3, step=0.1,
                           description="Space between packed shells, as a fraction of the UV square")
+    time_budget: FloatProperty(
+        name="Time Budget", default=180.0, min=0.0, soft_max=1800.0, step=1000, precision=0,
+        subtype='TIME_ABSOLUTE', unit='TIME_ABSOLUTE',
+        description="Seconds per object for merging shells (0 = no limit). Very dense objects can "
+                    "take hours to merge fully; when the time runs out the object keeps the shells "
+                    "it has. Every shell is still checked for overlap, flips and stretch")
     samples: IntProperty(name="Visibility Samples", default=32, min=4, max=256, soft_max=128,
                          description="Rays per face for the occlusion estimate. More = smoother visibility, "
                                      "slower on dense meshes")
@@ -96,7 +102,8 @@ class SMARTSEAMS_PG_settings(bpy.types.PropertyGroup):
             max_islands=self.max_islands, max_distortion=self.max_distortion,
             panel_angle=math.degrees(self.panel_angle), front=self.front, use_ground=self.use_ground,
             min_hidden_scale=self.min_hidden_scale, straighten=self.straighten,
-            unwrap_method=self.unwrap_method or 'ANGLE_BASED', margin=self.margin, samples=self.samples)
+            unwrap_method=self.unwrap_method or 'ANGLE_BASED', margin=self.margin, samples=self.samples,
+            time_budget=self.time_budget)
         for k, v in overrides.items():
             setattr(o, k, v)
         return o
@@ -366,6 +373,8 @@ Replaces the active UV map and the seams of the selected meshes"""
             extra = ""
             if r.get("uv_overlap_pct"):
                 extra = f", {r['uv_overlap_pct']}% overlap"
+            if (r.get("solver") or {}).get("time_budget_hit"):
+                extra += " (time budget reached: more shells than ideal)"
             items.append(f"{n} {_plural(shells, 'shell')}{extra}")
             if st.uv_name:
                 replaced.setdefault(st.uv_name, []).append(n)
@@ -457,6 +466,7 @@ def _draw(layout, context):
     box.prop(s, "max_islands")
     box.prop(s, "max_distortion")
     box.prop(s, "panel_angle")
+    box.prop(s, "time_budget")
 
     box = layout.box()
     box.label(text="Visibility")

@@ -24,6 +24,40 @@ from .flatten import boundary_crossings, face_triangles
 
 TMP_NAME = "__smart_seams_validator__"
 
+
+# ``bpy.ops`` refreshes the whole view layer before and after every operator
+# call. The trial unwraps only touch the hidden temporary mesh in Edit Mode
+# (its BMesh is updated by hand), so that refresh is pure overhead, and in a
+# big scene it costs more than the unwrap itself (965 objects: 14 ms a call,
+# two calls per trial). Call the operator directly when Blender allows it.
+try:
+    from _bpy import ops as _bpy_ops
+    _op_call = _bpy_ops.call
+except (ImportError, AttributeError):
+    _op_call = None
+
+
+def call_op(idname, **kw):
+    """``bpy.ops.<idname>(**kw)`` without the view layer refresh (see above).
+
+    Only for operators that work on the edit mesh and need no scene update:
+    the trial unwraps and the strip straightening.
+    """
+    global _op_call
+    if _op_call is not None:
+        try:
+            return _op_call(idname, kw)
+        except TypeError:  # signature changed in this Blender: use the normal path
+            _op_call = None
+    mod, name = idname.split(".")
+    return getattr(getattr(bpy.ops, mod), name)(**kw)
+
+
+def _trial_unwrap(**kw):
+    """``bpy.ops.uv.unwrap(**kw)`` without the view layer refresh."""
+    return call_op("uv.unwrap", **kw)
+
+
 # Optional ``callable(calls)`` invoked after every trial unwrap. The add-on's
 # operators set it to drive the progress indicator on slow objects.
 on_call = None
@@ -88,6 +122,7 @@ class BlenderValidator:
         self.unwraps = 0        # actual trial unwraps (cache misses)
         self.obj = None
         self._cache = {}
+        self.shell_stretch = {}  # faces that passed -> their stretch (merge headroom)
 
     def __enter__(self):
         ctx = bpy.context
@@ -145,6 +180,7 @@ class BlenderValidator:
         except (ReferenceError, RuntimeError):
             pass
         self._cache.clear()
+        self.shell_stretch.clear()
         return False
 
     def __call__(self, faces, glued, limit):
@@ -164,9 +200,13 @@ class BlenderValidator:
                 self._notify()
                 return False
             if crossings_ok is not None:
+                if crossings_ok:
+                    self.shell_stretch[frozenset(fset)] = dist
                 self._notify()
                 return crossings_ok
         result = self._unwrap_and_measure(faces, set(seam_ids), limit, key)
+        if result:
+            self.shell_stretch[frozenset(fset)] = self._cache[key][1]
         self._notify()
         return result
 
@@ -211,7 +251,7 @@ class BlenderValidator:
             nf.select = True
         bmesh.update_edit_mesh(me)
         try:
-            bpy.ops.uv.unwrap(method=self.method, fill_holes=True, correct_aspect=True, margin=0.0)
+            _trial_unwrap(method=self.method, fill_holes=True, correct_aspect=True, margin=0.0)
         except RuntimeError:
             return False
         bm = bmesh.from_edit_mesh(me)

@@ -26,16 +26,25 @@ same way:
 """
 
 import math
+import time
 
 from .seams import (bevel_crease_edges, complete_feature_lines, loop_smoothed_costs,
                     tube_ring_cuts)
 
 
+
+# A piece at most 1 / HEADROOM_SIZE the size of the shell it would join is
+# deferred while that shell's stretch is above HEADROOM x the current limit.
+HEADROOM = 0.95
+HEADROOM_SIZE = 10
+# Part of the merge time budget the first (strict) stretch pass may use.
+FIRST_PASS_SHARE = 0.65
+
 class PanelSettings:
     def __init__(self, *, panel_angle=40.0, max_shells=10,
                  stretch_steps=(0.08, 0.12, 0.2, 0.3), thin_ratio=0.05,
                  loop_smoothing=0.85, sharp_bonus=0.35, concave_bonus=0.6,
-                 max_split_depth=6):
+                 max_split_depth=6, time_budget=0.0):
         self.panel_angle = panel_angle          # edges sharper than this separate panels
         self.max_shells = max_shells            # hard limit on UV shells
         self.stretch_steps = stretch_steps      # stretch limits tried in order
@@ -44,6 +53,9 @@ class PanelSettings:
         self.sharp_bonus = sharp_bonus
         self.concave_bonus = concave_bonus
         self.max_split_depth = max_split_depth
+        # seconds for merging shells (0 = no limit), shared out over the
+        # stretch passes and the hinge phase; see merge_shells
+        self.time_budget = time_budget
         # names used by charts.seam_cost / loop_smoothed_costs
         self.angle_bucket = 10.0
 
@@ -656,6 +668,25 @@ class PanelSolver:
                     per += e.calc_length()
         return area / ((per / 2.0) ** 2 + 1e-12)
 
+    def _piece_count(self):
+        """Number of separate (edge-connected) parts of the mesh."""
+        seen = [False] * len(self.bm.faces)
+        pieces = 0
+        for f in self.bm.faces:
+            if seen[f.index]:
+                continue
+            pieces += 1
+            seen[f.index] = True
+            stack = [f]
+            while stack:
+                g = stack.pop()
+                for e in g.edges:
+                    for h in e.link_faces:
+                        if not seen[h.index]:
+                            seen[h.index] = True
+                            stack.append(h)
+        return pieces
+
     def merge_shells(self):
         s = self.s
         shells = {i: list(p) for i, p in enumerate(self.panels)}
@@ -838,7 +869,25 @@ class PanelSolver:
             options += runs
             return attempt(a, b, options, limit)
 
+        stretch_of = getattr(self.validate, "shell_stretch", None)
+
+        def no_headroom(a, b, limit):
+            """A small piece joining a much bigger shell that already sits
+            near the limit: the union is the big shell re-unwrapped (slow on a
+            dense mesh) and nearly always fails by a hair. Defer it to the
+            next, more relaxed pass, where it is tried again. On a 27k-face
+            mesh this skipped 70 % of the trial unwraps of the strict pass."""
+            if stretch_of is None:
+                return False
+            big, small = (a, b) if len(shells[a]) >= len(shells[b]) else (b, a)
+            if len(shells[small]) * HEADROOM_SIZE > len(shells[big]):
+                return False
+            d = stretch_of.get(frozenset(shells[big]))
+            return d is not None and d > HEADROOM * limit
+
         def attempt(a, b, options, limit):
+            if no_headroom(a, b, limit):
+                return False
             for glue in options:
                 for ei in glue:
                     self.glued[ei] = True
@@ -874,13 +923,107 @@ class PanelSolver:
             vis_cost = sum(self.cost[i] for i in edge_ids)
             return (1, -vis_cost / (area ** 0.5 + 1e-9))
 
+        # Separate parts of the mesh can never share a shell, so a mesh of 27
+        # loose parts needs at least 27 shells. Aim for that instead of Max
+        # Shells when it is higher: chasing an impossible target ran every
+        # relaxed limit, hinge, relief cut and dart for every pair of shells.
+        target = max(s.max_shells, self._piece_count())
+        self.stats["shell_target"] = target
+
+        def try_groups(limit):
+            """Join small pieces to a big shell several at a time.
+
+            On a dense mesh hundreds of small pieces each join one big shell,
+            and every single join re-unwraps the whole big shell. Each piece
+            goes with the neighbour it shares its longest border with (the
+            same rule the pairwise search uses for small pieces), and the
+            pieces of one big shell are tried together, then by halves. Every
+            accepted union is validated exactly like a single merge; pieces
+            left over go through the pairwise search as before.
+            """
+            groups = {}
+            for x in list(shells):
+                bd = borders(x)
+                if not bd:
+                    continue
+                nb = max(bd, key=lambda y: sum(self.bm.edges[i].calc_length() for i in bd[y]))
+                if len(shells[x]) * HEADROOM_SIZE <= len(shells[nb]):
+                    groups.setdefault(nb, []).append((x, bd[nb]))
+            for big in sorted(groups, key=lambda k: -len(shells[k])):
+                if out_of_time():
+                    return False
+                group = groups[big]
+                if len(group) < 2:
+                    continue
+                d = stretch_of.get(frozenset(shells[big])) if stretch_of is not None else None
+                if d is not None and d > HEADROOM * limit:
+                    continue
+                gkey = ("group", big, len(shells[big]), frozenset(x for x, _ in group), limit)
+                if gkey in refused:
+                    continue
+                refused.add(gkey)
+                half = len(group) // 2
+                for part in (group, group[:half], group[half:]):
+                    if len(part) >= 2 and merge_group(big, part, limit):
+                        return True
+            return False
+
+        def merge_group(big, part, limit):
+            glue = [ei for _x, eids in part for ei in eids]
+            for ei in glue:
+                self.glued[ei] = True
+            union = shells[big] + [fi for x, _e in part for fi in shells[x]]
+            if self._ok(union, limit):
+                for x, _e in part:
+                    for fi in shells[x]:
+                        shell_of[fi] = big
+                    shells[big].extend(shells.pop(x))
+                    stats_cache.pop(x, None)
+                stats_cache.pop(big, None)
+                self.stats["group_merges"] = self.stats.get("group_merges", 0) + len(part)
+                return True
+            for ei in glue:
+                self.glued[ei] = False
+            return False
+
+        # Time budget: on a very dense mesh the exhaustive search can take hours
+        # (every trial re-unwraps thousands of faces). The first, strict pass
+        # gets most of the time (FIRST_PASS_SHARE): it does nearly all the
+        # merging, hundreds of small pieces onto their neighbours, and a 27k
+        # mesh cut off there after an even share kept 787 shells. The later
+        # passes and last the hinge phase each get an even share of the time
+        # still left when they start, so the relaxed passes always run. When
+        # a share runs out the pass ends with the shells it has: each one is
+        # still fully validated, there are just more of them.
+        merge_end = (time.perf_counter() + s.time_budget) if s.time_budget else None
+        deadline = [None]
+
+        def start_pass(parts_left, share=None):
+            if merge_end is not None:
+                now = time.perf_counter()
+                left = max(0.0, merge_end - now)
+                deadline[0] = now + (left * share if share else left / parts_left)
+
+        def out_of_time():
+            if deadline[0] is not None and time.perf_counter() > deadline[0]:
+                self.stats["time_budget_hit"] = True
+                return True
+            return False
+
         refused = set()
+        n_steps = len(s.stretch_steps)
         for li, limit in enumerate(s.stretch_steps):
+            # this pass, the rest, and the hinges
+            start_pass(n_steps - li + 1, FIRST_PASS_SHARE if li == 0 and n_steps > 1 else None)
             # first step: merge freely (fewer shells is better);
             # later steps: only while above the hard limit
             while True:
-                if li > 0 and len(shells) <= s.max_shells:
+                if li > 0 and len(shells) <= target:
                     break
+                if out_of_time():
+                    break
+                if try_groups(limit):
+                    continue
                 cands = []
                 for a in list(shells):
                     for b, eids in borders(a).items():
@@ -893,6 +1036,8 @@ class PanelSolver:
                 cands.sort(key=lambda c: c[0])
                 merged = False
                 for _p, a, b, eids, key in cands:
+                    if out_of_time():
+                        break
                     if try_merge(a, b, eids, limit):
                         merged = True
                         break
@@ -910,7 +1055,8 @@ class PanelSolver:
         # stay above the limit (reported as ``max_shells_unmet``).
         ceiling = s.stretch_steps[-1]
         hinged = 0
-        while len(shells) > s.max_shells:
+        start_pass(1)
+        while len(shells) > target and not out_of_time():
             cands = []
             for a in list(shells):
                 for b, eids in borders(a).items():
@@ -921,6 +1067,8 @@ class PanelSolver:
             cands.sort(key=lambda c: c[0])
             merged = False
             for _p, a, b, eids, key in cands:
+                if out_of_time():
+                    break
                 if try_merge(a, b, eids, ceiling, hinge=True):
                     merged = True
                     hinged += 1
@@ -929,7 +1077,7 @@ class PanelSolver:
             if not merged:
                 break
         self.stats["hinge_merges"] = hinged
-        if len(shells) > s.max_shells:
+        if len(shells) > target:
             self.stats["max_shells_unmet"] = True
         self.shells = list(shells.values())
         self.stats["shells"] = len(self.shells)

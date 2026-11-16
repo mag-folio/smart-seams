@@ -17,7 +17,7 @@ import random
 import bmesh
 import bpy
 
-from . import keepalive, metrics
+from . import blender_validator, keepalive, metrics
 
 
 def _island_stretch(faces, uv_layer):
@@ -188,7 +188,7 @@ def _active_candidates(faces, count):
 
 
 def straighten_quad_islands(obj, charts, max_stretch=0.12, max_area=0.1,
-                            max_angle=math.radians(10.5), tries=12):
+                            max_angle=math.radians(10.5), tries=12, time_limit=None):
     """Follow-Active-Quads on all-quad charts (rims, bands, leg strips).
 
     Straight strips pack far tighter than arcs and are much easier to paint
@@ -208,11 +208,17 @@ def straighten_quad_islands(obj, charts, max_stretch=0.12, max_area=0.1,
     those kept only under the relaxed (angle-trading) rule, a map of chart
     index -> UV snapshot of the unwrap, so the caller can undo them when
     the long strip they make costs more texture space than it is worth.
+
+    ``time_limit`` (seconds): charts not reached in time keep their unwrap.
     """
+    import time
     me = obj.data
     straightened = 0
     relaxed = {}
+    end = (time.perf_counter() + time_limit) if time_limit else None
     for ci, faces_idx in enumerate(charts):
+        if end is not None and time.perf_counter() > end:
+            break
         bm = bmesh.from_edit_mesh(me)
         bm.faces.ensure_lookup_table()
         uv_layer = bm.loops.layers.uv.active
@@ -243,7 +249,7 @@ def straighten_quad_islands(obj, charts, max_stretch=0.12, max_area=0.1,
             _square_active(active, uv_layer)
             bmesh.update_edit_mesh(me)
             try:
-                bpy.ops.uv.follow_active_quads(mode='LENGTH_AVERAGE')
+                blender_validator.call_op("uv.follow_active_quads", mode='LENGTH_AVERAGE')
             except RuntimeError:
                 continue
             bm = bmesh.from_edit_mesh(me)
@@ -574,8 +580,20 @@ def _min_rect_angle(points):
     return best[1]
 
 
+def _fft_size(n):
+    """Smallest length >= n with no prime factors above 5."""
+    while True:
+        m = n
+        for p in (2, 3, 5):
+            while m % p == 0:
+                m //= p
+        if m == 1:
+            return n
+        n += 1
+
+
 def raster_pack(islands, margin, coverage_floor, res=300, steps=6, n_angles=16,
-                strategies=(('area', 'top'), ('bbox', 'corner'))):
+                strategies=(('area', 'top'), ('bbox', 'corner')), time_limit=None):
     """Bottom-left raster packer with free rotation for irregular islands.
 
     ``islands``: list of ``(tris, pinned)`` with ``tris`` an N x 3 x 2 numpy
@@ -593,9 +611,15 @@ def raster_pack(islands, margin, coverage_floor, res=300, steps=6, n_angles=16,
 
     Returns ``(coverage, [(angle, scale, tx, ty) per island])`` mapping a UV
     point p to ``rot(angle) @ p * scale + (tx, ty)``, or None if it found
-    nothing better than ``coverage_floor``.
+    nothing better than ``coverage_floor``. With ``time_limit`` (seconds) it
+    stops searching when the time is up and returns the best fit found.
     """
+    import time
     import numpy as np
+    end = (time.perf_counter() + time_limit) if time_limit else None
+
+    def late():
+        return end is not None and time.perf_counter() > end
     areas = [float(np.abs(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])).sum()) * 0.5
              for t, _ in islands]
     area = sum(areas)
@@ -633,9 +657,15 @@ def raster_pack(islands, margin, coverage_floor, res=300, steps=6, n_angles=16,
         k = int(math.ceil(margin * 0.5 * size))  # half margin, in pixels
         occ = np.zeros((size, size), dtype=float)
         placed = [None] * len(islands)
+        # FFTs at a 2-3-5 smooth length are several times faster than at an
+        # arbitrary (often prime) size. Zero padding changes nothing in the
+        # region read below: there the mask lies wholly inside the texture.
+        n = _fft_size(size)
         for i in order:
             keepalive.pulse()
-            occ_f = np.fft.rfft2(occ)
+            if late():
+                return None
+            occ_f = np.fft.rfft2(occ, s=(n, n))
             best = None
             for a, lo, raw in cands[i]:
                 keepalive.pulse()
@@ -648,7 +678,7 @@ def raster_pack(islands, margin, coverage_floor, res=300, steps=6, n_angles=16,
                     continue
                 mp = np.zeros((size, size))
                 mp[:h, :w] = m
-                hit = np.fft.irfft2(occ_f * np.conj(np.fft.rfft2(mp)), s=(size, size))
+                hit = np.fft.irfft2(occ_f * np.conj(np.fft.rfft2(mp, s=(n, n))), s=(n, n))
                 free = hit[:size - h + 1, :size - w + 1] < 0.5
                 if not free.any():
                     continue
@@ -693,7 +723,7 @@ def raster_pack(islands, margin, coverage_floor, res=300, steps=6, n_angles=16,
 
     best = None
     for _ in range(steps):
-        if hi_size - lo_size <= 1:
+        if hi_size - lo_size <= 1 or late():
             break
         mid = (lo_size + hi_size) // 2
         got = attempt_any(mid)
@@ -713,7 +743,7 @@ def raster_pack(islands, margin, coverage_floor, res=300, steps=6, n_angles=16,
 
 
 def pack(obj, charts, pinned_charts=(), margin=0.01, variants=PACK_VARIANTS, starts=4,
-         use_raster=True):
+         use_raster=True, raster_time=None):
     """Pack all islands into 0-1 as tightly as Blender's packer allows.
 
     * Islands keep their relative scale (equal texel density, then the
@@ -840,7 +870,7 @@ def pack(obj, charts, pinned_charts=(), margin=0.01, variants=PACK_VARIANTS, sta
                 pts = [tuple(snap[(fi, j)]) for j in range(len(bm.faces[fi].loops))]
                 tris += [(pts[0], pts[j], pts[j + 1]) for j in range(1, len(pts) - 1)]
             islands.append((np.array(tris, dtype=float), bool(set(c) & pinned_faces)))
-        got = raster_pack(islands, margin * 2.0, best[0])
+        got = raster_pack(islands, margin * 2.0, best[0], time_limit=raster_time)
         if got is not None:
             for c, (a, sc, tx, ty) in zip(charts, got[1]):
                 ca, sa = math.cos(a) * sc, math.sin(a) * sc

@@ -33,6 +33,7 @@ class Options:
         self.straighten = True
         self.margin = 0.01
         self.mark_seams_only = False
+        self.time_budget = 180.0     # seconds for merging shells per object (0 = no limit)
         for k, v in kw.items():
             if not hasattr(self, k):
                 raise AttributeError(k)
@@ -73,7 +74,8 @@ def solve_seams(obj, opts):
     steps = tuple(d for d in (0.08, 0.12, 0.2, 0.3, 0.45) if d < opts.max_distortion) + (opts.max_distortion,)
     settings = panels_mod.PanelSettings(panel_angle=opts.panel_angle,
                                         max_shells=opts.max_islands,
-                                        stretch_steps=steps)
+                                        stretch_steps=steps,
+                                        time_budget=opts.time_budget)
     with BlenderValidator(method=opts.unwrap_method) as validator:
         chart_of_face, seams = panels_mod.compute_shells(bm, vis, settings, validator)
     stats = dict(panels_mod.LAST_STATS)
@@ -132,8 +134,12 @@ def _unwrap(obj, opts=None):
         bpy.ops.uv.unwrap(method=opts.unwrap_method, fill_holes=True,
                           correct_aspect=True, margin=0.0)
         relaxed = {}
+        # The polish steps (straightening strips, the raster packer's second
+        # opinion) each get a quarter of the time budget, at least 20 s; when
+        # it is up they keep the valid result they have.
+        polish = max(20.0, opts.time_budget * 0.25) if opts.time_budget else None
         if opts.straighten:
-            report["straightened"], relaxed = layout.straighten_quad_islands(obj, charts)
+            report["straightened"], relaxed = layout.straighten_quad_islands(obj, charts, time_limit=polish)
         anchors = report["solver"].pop("anchors", [])
         uv_layer = bmesh.from_edit_mesh(me).loops.layers.uv.active
         unpacked = layout._snapshot(bmesh.from_edit_mesh(me).faces, uv_layer)
@@ -143,7 +149,7 @@ def _unwrap(obj, opts=None):
             layout.scale_by_visibility(obj, charts, vis, min_scale=opts.min_hidden_scale)
             # grid-aligned shells keep their rotation (pinned); the packer
             # may still turn irregular shells to fit tighter
-            coverage = layout.pack(obj, charts, aligned, margin=opts.margin)[0]
+            coverage = layout.pack(obj, charts, aligned, margin=opts.margin, raster_time=polish)[0]
             return coverage, len(aligned)
 
         coverage, report["grid_aligned"] = finish()
