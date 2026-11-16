@@ -122,6 +122,8 @@ class BlenderValidator:
         self.unwraps = 0        # actual trial unwraps (cache misses)
         self.obj = None
         self._cache = {}
+        self._local = {}        # local_check results per exact input
+        self.local_unwraps = 0  # small patch unwraps done by local_check
         self.shell_stretch = {}  # faces that passed -> their stretch (merge headroom)
 
     def __enter__(self):
@@ -180,6 +182,7 @@ class BlenderValidator:
         except (ReferenceError, RuntimeError):
             pass
         self._cache.clear()
+        self._local.clear()
         self.shell_stretch.clear()
         return False
 
@@ -220,6 +223,26 @@ class BlenderValidator:
 
     def _unwrap_and_measure(self, faces, seam_ids, limit, key):
         self.unwraps += 1
+        if self._trial_mesh(faces, seam_ids) is None:
+            self._cache[key] = (False, math.inf, None)
+            return False  # duplicate face: cannot validate, treat as bad
+        try:
+            _trial_unwrap(method=self.method, fill_holes=True, correct_aspect=True, margin=0.0)
+        except RuntimeError:
+            return False
+        bm = bmesh.from_edit_mesh(self.obj.data)
+        uvl = bm.loops.layers.uv.active
+        ok, dist, uv, T = self._measure(bm, uvl)
+        if not ok or dist > limit:
+            self._cache[key] = (ok, dist, None)
+            return False
+        crossings_ok = boundary_crossings(uv, T) == 0
+        self._cache[key] = (ok, dist, crossings_ok)
+        return crossings_ok
+
+    def _trial_mesh(self, faces, seam_ids):
+        """Replace the temporary mesh by ``faces`` (seams on ``seam_ids``),
+        all selected. Returns its BMesh, or None if a face is a duplicate."""
         me = self.obj.data
         bm = bmesh.from_edit_mesh(me)
         bm.clear()
@@ -233,8 +256,7 @@ class BlenderValidator:
             try:
                 nf = bm.faces.new([vmap[v.index] for v in f.verts])
             except ValueError:
-                self._cache[key] = (False, math.inf, None)
-                return False  # duplicate face: cannot validate, treat as bad
+                return None
             new_faces.append(nf)
         # seams = unglued edges between two faces of this set
         if seam_ids:
@@ -250,31 +272,71 @@ class BlenderValidator:
         for nf in new_faces:
             nf.select = True
         bmesh.update_edit_mesh(me)
+        return bm
+
+    def local_check(self, faces, glued, piece, limit):
+        """Pre-check for joining a small piece to a very big shell. It can
+        only *reject* a join, never accept one.
+
+        ``faces`` is the piece plus the part of the big shell around it (a
+        few face rings), with the join glued. The patch is unwrapped like any
+        trial; the join is refused if the patch folds over or overlaps
+        itself, or if the piece's own faces (``piece``, a set of face
+        indices) stretch past ``limit`` measured against the patch around
+        them. Such a join would re-unwrap thousands of faces only to fail, or
+        to pass by hiding the piece's stretch in the big shell's average.
+        Returns False to refuse; True means "now run the full trial".
+        """
+        fset = {f.index for f in faces}
+        seam_ids = set()
+        for f in faces:
+            for e in f.edges:
+                lf = e.link_faces
+                if len(lf) == 2 and lf[0].index in fset and lf[1].index in fset and not glued[e.index]:
+                    seam_ids.add(e.index)
+        key = (tuple(f.index for f in faces), frozenset(seam_ids), frozenset(piece))
+        cached = self._local.get(key)
+        if cached is None:
+            cached = self._local[key] = self._local_measure(faces, seam_ids, piece)
+            self.local_unwraps += 1
+            self._notify()
+        ok, stretch = cached
+        return ok and stretch <= limit
+
+    def _local_measure(self, faces, seam_ids, piece):
+        """``(no flips and no overlap, stretch of the piece's faces)``."""
+        if self._trial_mesh(faces, seam_ids) is None:
+            return False, math.inf
         try:
             _trial_unwrap(method=self.method, fill_holes=True, correct_aspect=True, margin=0.0)
         except RuntimeError:
-            return False
-        bm = bmesh.from_edit_mesh(me)
+            return False, math.inf
+        bm = bmesh.from_edit_mesh(self.obj.data)
         uvl = bm.loops.layers.uv.active
-        ok, dist, uv, T = self._measure(bm, uvl)
-        if not ok or dist > limit:
-            self._cache[key] = (ok, dist, None)
-            return False
-        crossings_ok = boundary_crossings(uv, T) == 0
-        self._cache[key] = (ok, dist, crossings_ok)
-        return crossings_ok
+        # the temporary mesh's faces are in the order of ``faces``
+        mark = [f.index in piece for f in faces]
+        ok, _dist, uv, T, part = self._measure(bm, uvl, mark)
+        if not ok or boundary_crossings(uv, T) != 0:
+            return False, math.inf
+        return True, part
 
     @staticmethod
-    def _measure(bm, uvl):
+    def _measure(bm, uvl, mark=None):
         """Return ``(ok, stretch, uv, tris)``; ``ok`` is False for degenerate
-        or flipped results."""
+        or flipped results.
+
+        With ``mark`` (one bool per face, in face order) a fifth value is
+        returned: the stretch of the marked faces alone, measured against the
+        scale of the whole unwrap."""
         # triangles with 3D area and UV coordinates; UV vertices keyed by
         # (vertex, rounded uv) so seams split them
         key_id = {}
         uv_pts = []
         tris = []
         area3 = []
-        for f in bm.faces:
+        marked = []
+        bad = (False, math.inf, None, None) if mark is None else (False, math.inf, None, None, math.inf)
+        for fi, f in enumerate(bm.faces):
             loops = list(f.loops)
             ids = []
             for l in loops:
@@ -291,8 +353,10 @@ class BlenderValidator:
                     continue
                 tris.append((ids[i0], ids[i1], ids[i2]))
                 area3.append(a)
+                if mark is not None:
+                    marked.append(mark[fi])
         if not tris:
-            return False, math.inf, None, None
+            return bad
         uv = np.array(uv_pts)
         T = np.array(tris)
         A3 = np.array(area3)
@@ -300,12 +364,17 @@ class BlenderValidator:
         A2 = 0.5 * ((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (c[:, 0] - a[:, 0]) * (b[:, 1] - a[:, 1]))
         tot2, tot3 = np.abs(A2).sum(), A3.sum()
         if tot2 <= 1e-14:
-            return False, math.inf, None, None
+            return bad
         sign = 1.0 if A2.sum() >= 0 else -1.0
         if A3[(A2 * sign) <= 0].sum() / tot3 > 0.001:
-            return False, math.inf, None, None
+            return bad
         r = np.abs(A2) / (A3 * tot2 / tot3)
-        dist = float((A3 * np.abs(np.log(np.clip(r, 1e-6, None)))).sum() / tot3)
+        logs = A3 * np.abs(np.log(np.clip(r, 1e-6, None)))
+        dist = float(logs.sum() / tot3)
         if not math.isfinite(dist):
-            return False, math.inf, None, None
-        return True, dist, uv, T
+            return bad
+        if mark is None:
+            return True, dist, uv, T
+        m = np.array(marked, bool)
+        part = float(logs[m].sum() / A3[m].sum()) if m.any() else 0.0
+        return True, dist, uv, T, part

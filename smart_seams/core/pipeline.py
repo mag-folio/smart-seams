@@ -71,7 +71,8 @@ def solve_seams(obj, opts):
 
     vis = face_visibility(bm, obj.matrix_world, samples=opts.samples,
                           use_ground=opts.use_ground, front=_front_vector(obj, opts))
-    steps = tuple(d for d in (0.08, 0.12, 0.2, 0.3, 0.45) if d < opts.max_distortion) + (opts.max_distortion,)
+    # (the property is a float32: 0.2 arrives as 0.20000000298, which is not a step of its own)
+    steps = tuple(d for d in (0.08, 0.12, 0.2, 0.3, 0.45) if d < opts.max_distortion - 1e-6) + (opts.max_distortion,)
     settings = panels_mod.PanelSettings(panel_angle=opts.panel_angle,
                                         max_shells=opts.max_islands,
                                         stretch_steps=steps,

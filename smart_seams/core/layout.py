@@ -90,9 +90,36 @@ def _faces_overlap(faces, uv_layer):
     Catches folds that keep every face's orientation and a clean outline
     (Follow Active Quads round a pole vertex can lay one quad on another).
     """
+    def area(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
+
     tris = []
     for f in faces:
         uv = [(l[uv_layer].uv.x, l[uv_layer].uv.y) for l in f.loops]
+        if len(uv) == 4:
+            # A quad is split along the diagonal that lies inside it. The fan
+            # from corner 0 is wrong for a quad that is concave or has three
+            # corners nearly in line (kite-shaped quads where the bars of a
+            # lattice meet): one triangle comes out reversed, sticks out of
+            # the quad and "overlaps" its neighbours. On a 27k-face basket
+            # that false alarm rejected every packed layout.
+            a, b, c, d = uv
+            fan = min(area(a, b, c), area(a, c, d)), max(area(a, b, c), area(a, c, d))
+            alt = min(area(a, b, d), area(b, c, d)), max(area(a, b, d), area(b, c, d))
+            if fan[0] * fan[1] <= 0 and alt[0] * alt[1] > 0:
+                tris.append((f.index, (a, b, d)))
+                tris.append((f.index, (b, c, d)))
+                continue
+        elif len(uv) > 4:
+            # same for a concave n-gon: triangulate it properly
+            fan = [area(uv[0], uv[i], uv[i + 1]) for i in range(1, len(uv) - 1)]
+            if min(fan) * max(fan) <= 0:
+                from mathutils import Vector
+                from mathutils.geometry import tessellate_polygon
+                cut = tessellate_polygon([[Vector((x, y, 0.0)) for x, y in uv]])
+                if len(cut) == len(uv) - 2:
+                    tris.extend((f.index, (uv[i], uv[j], uv[k])) for i, j, k in cut)
+                    continue
         for i in range(1, len(uv) - 1):
             tris.append((f.index, (uv[0], uv[i], uv[i + 1])))
     if not tris:

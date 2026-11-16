@@ -39,6 +39,19 @@ HEADROOM = 0.95
 HEADROOM_SIZE = 10
 # Part of the merge time budget the first (strict) stretch pass may use.
 FIRST_PASS_SHARE = 0.65
+# A small piece joining a shell of at least LOCAL_MIN_FACES faces is first
+# unwrapped together with only the LOCAL_RINGS face rings of that shell
+# around it (see ``local_ok`` in merge_shells). The same size decides which
+# panels count as dense elsewhere; smaller meshes are solved as before.
+LOCAL_MIN_FACES = 1000
+LOCAL_RINGS = 6
+# A ring of side panels round an axis that is not a world axis: most panels
+# it may have, and the largest share of the mesh's area it may cover.
+MAX_RING = 64
+SMALL_RING_AREA = 0.01
+# Hinge phase: after this many small pieces in a row found no hinge onto a
+# shell of LOCAL_MIN_FACES faces or more, the rest of them are not tried.
+HINGE_STREAK = 24
 
 class PanelSettings:
     def __init__(self, *, panel_angle=40.0, max_shells=10,
@@ -285,22 +298,34 @@ class PanelSolver:
                 groups.setdefault(find(v.index), set()).add(v.index)
         return list(groups.values())
 
-    def _cut_path(self, idx, ring_cuts):
+    def _cut_path(self, idx, ring_cuts, ends=False):
         """Cut a wrapping panel open: prefer the aligned ring cut edges inside
-        it, else the cheapest path between two of its boundary loops."""
+        it, else the cheapest path between two of its boundary loops.
+
+        With ``ends`` it is always a path, and between the two *longest*
+        loops. On a tube wall with holes in it (a mesh waste basket) the
+        short loops are hole rims and a cut from one hole to the next opens
+        nothing, and the ring cuts only cover the plain rings above and below
+        the holes; the cut has to run from one end of the tube to the other.
+        ``ends`` returns nothing for a panel without such holes (two loops
+        or fewer) and for panels under LOCAL_MIN_FACES faces: an 810-face
+        tube with ten holes came out with the same 10 shells either way, but
+        a little more stretch when cut than when split in two."""
         import heapq
         fset = set(idx)
         inner = [e for fi in idx for e in self.bm.faces[fi].edges
                  if self.glued[e.index] and all(g.index in fset for g in e.link_faces)]
         inner_ids = {e.index for e in inner}
         planned = [ei for ei in ring_cuts if ei in inner_ids]
-        if planned:
+        if planned and not ends:
             return planned
+        if ends and len(idx) < LOCAL_MIN_FACES:
+            return []
         loops = self._boundary_loops(idx)
-        if len(loops) < 2:
+        if len(loops) < (3 if ends else 2):
             return []
         loops.sort(key=len)
-        src, dst = loops[0], loops[1]
+        src, dst = (loops[-1], loops[-2]) if ends else (loops[0], loops[1])
         adj = {}
         for e in inner:
             a, b = e.verts[0].index, e.verts[1].index
@@ -528,16 +553,22 @@ class PanelSolver:
             if known_ok or len(idx) <= 1 or self._ok(idx, limit):
                 out.append(idx)
                 continue
-            path = self._cut_path(idx, ring_cuts)
-            if path:
+            opened = False
+            for ends in (False, True):
+                path = self._cut_path(idx, ring_cuts, ends)
+                if not path:
+                    continue
                 for ei in path:
                     self.glued[ei] = False
                 if self._ok(idx, limit):
-                    cuts += 1
-                    out.append(idx)
-                    continue
+                    opened = True
+                    break
                 for ei in path:
                     self.glued[ei] = True
+            if opened:
+                cuts += 1
+                out.append(idx)
+                continue
             if depth >= self.s.max_split_depth:
                 out.append(idx)
                 continue
@@ -566,6 +597,7 @@ class PanelSolver:
         that leaves seams on several visible vertical edges.
         """
         from mathutils import Vector
+        default_axes = not axes
         axes = axes or (Vector((0, 0, 1)), Vector((1, 0, 0)), Vector((0, 1, 0)))
         limit = self.s.stretch_steps[0]
         panel_of = {}
@@ -574,7 +606,58 @@ class PanelSolver:
                 panel_of[fi] = pid
         normals = [self._panel_normal(idx) for idx in self.panels]
         used = set()
-        bands = 0
+        bands = [0]
+
+        def try_band(start, comp, nbrs, border, axis):
+            # a band is a simple cycle (degree 2)
+            if len(comp) < 3 or any(len(nbrs.get(p, ())) != 2 for p in comp):
+                return False
+            # walk the cycle and check it really wraps round the axis
+            order = [start, nbrs[start][0]]
+            while len(order) < len(comp):
+                a, b = nbrs[order[-1]]
+                order.append(a if a != order[-2] else b)
+            if len(set(order)) != len(comp):
+                return False
+            turn = 0.0
+            for i, p in enumerate(order):
+                q = order[(i + 1) % len(order)]
+                turn += math.degrees(normals[p].angle(normals[q], 0.0))
+            if turn < min_turn_deg:
+                return False
+            pairs = [(min(p, q), max(p, q)) for p, q in
+                     ((order[i], order[(i + 1) % len(order)]) for i in range(len(order)))]
+            if any(k not in border for k in pairs):
+                return False
+            # cut on the least visible border, glue the others
+            cut = min(pairs, key=lambda k: sum(self.cost[i] for i in border[k]))
+            glue = [ei for k in pairs if k != cut for ei in border[k]]
+            for ei in glue:
+                self.glued[ei] = True
+            strip = [fi for p in order for fi in self.panels[p]]
+            if not self._ok(strip, limit):
+                for ei in glue:
+                    self.glued[ei] = False
+                return False
+            used.update(comp)
+            bands[0] += 1
+            # the strip's two end panels sit either side of the cut; the
+            # caps go on the more visible one, so their remaining seams
+            # (the other panels' rims) are the more hidden ones
+            ends = [p for p in order if any(k == cut for k in
+                    ((min(p, q), max(p, q)) for q in nbrs[p]))]
+
+            def rim_cost(p):
+                fset = set(self.panels[p])
+                return sum(self.cost[e.index] for fi in self.panels[p]
+                           for e in self.bm.faces[fi].edges
+                           if e.index not in border.get(cut, ())
+                           and any(g.index not in fset for g in e.link_faces)
+                           and abs((e.verts[1].co - e.verts[0].co).normalized().dot(axis)) < 0.7)
+            self.anchors.append(set(self.panels[max(ends, key=rim_cost)]))
+            self.log.append(f"side band: {len(order)} panels round {tuple(axis)}")
+            return True
+
         for axis in axes:
             side = {pid for pid, n in enumerate(normals)
                     if pid not in used and n is not None and abs(n.dot(axis)) < max_tilt}
@@ -607,54 +690,86 @@ class PanelSolver:
                             comp.add(q)
                             stack.append(q)
                 seen |= comp
-                if len(comp) < 3 or any(len(nbrs[p]) != 2 for p in comp):
+                try_band(start, comp, nbrs, border, axis)
+
+        # Small rings round any other direction: the walls of a hole through
+        # a tilted or curved surface. A mesh waste basket has hundreds of
+        # such holes, each with four wall panels; left apart they were over a
+        # thousand panels to merge. The axis is taken from a border between
+        # two panels (the corner line they share) and the ring is searched
+        # from there, with the same rules as above. World-axis bands are
+        # found first, so objects that had bands before keep exactly those,
+        # and only rings of at most SMALL_RING_AREA of the surface are joined
+        # this way: for the main panels of a tilted object the merge search
+        # does better than a forced strip (a 96-face lamp got a shell more).
+        total_area = sum(self.area) or 1.0
+        if default_axes:
+            inter, dirs = {}, {}
+            for e in self.bm.edges:
+                lf = e.link_faces
+                if len(lf) != 2 or self.glued[e.index]:
                     continue
-                # walk the cycle and check it really wraps round the axis
-                order = [start, nbrs[start][0]]
-                while len(order) < len(comp):
-                    a, b = nbrs[order[-1]]
-                    order.append(a if a != order[-2] else b)
-                turn = 0.0
-                for i, p in enumerate(order):
-                    q = order[(i + 1) % len(order)]
-                    turn += math.degrees(normals[p].angle(normals[q], 0.0))
-                if turn < min_turn_deg:
+                a, b = panel_of[lf[0].index], panel_of[lf[1].index]
+                if a == b or a in used or b in used:
                     continue
-                pairs = [(min(p, q), max(p, q)) for p, q in
-                         ((order[i], order[(i + 1) % len(order)]) for i in range(len(order)))]
-                if any(k not in border for k in pairs):
+                d = e.verts[1].co - e.verts[0].co
+                if d.length < 1e-12:
                     continue
-                # cut on the least visible border, glue the others
-                cut = min(pairs, key=lambda k: sum(self.cost[i] for i in border[k]))
-                glue = [ei for k in pairs if k != cut for ei in border[k]]
-                for ei in glue:
-                    self.glued[ei] = True
-                strip = [fi for p in order for fi in self.panels[p]]
-                if not self._ok(strip, limit):
-                    for ei in glue:
-                        self.glued[ei] = False
+                dirs[e.index] = d.normalized()
+                inter.setdefault((min(a, b), max(a, b)), []).append(e.index)
+            pn = {}
+            for a, b in inter:
+                pn.setdefault(a, []).append(b)
+                pn.setdefault(b, []).append(a)
+            tried = {}
+            for key in sorted(inter):
+                a, b = key
+                if a in used or b in used:
                     continue
-                used |= comp
-                bands += 1
-                # the strip's two end panels sit either side of the cut; the
-                # caps go on the more visible one, so their remaining seams
-                # (the other panels' rims) are the more hidden ones
-                ends = [p for p in order if any(k == cut for k in
-                        ((min(p, q), max(p, q)) for q in nbrs[p]))]
-                def rim_cost(p):
-                    fset = set(self.panels[p])
-                    return sum(self.cost[e.index] for fi in self.panels[p]
-                               for e in self.bm.faces[fi].edges
-                               if e.index not in border.get(cut, ())
-                               and any(g.index not in fset for g in e.link_faces)
-                               and abs((e.verts[1].co - e.verts[0].co).normalized().dot(axis)) < 0.7)
-                self.anchors.append(set(self.panels[max(ends, key=rim_cost)]))
-                self.log.append(f"side band: {len(order)} panels round {tuple(axis)}")
+                es = inter[key]
+                acc = Vector()
+                for ei in es:
+                    acc += dirs[ei] if dirs[ei].dot(dirs[es[0]]) >= 0 else -dirs[ei]
+                if acc.length < 1e-9:
+                    continue
+                axis = acc.normalized()
+                if any(abs(axis.dot(x)) > 0.97 for x in axes):
+                    continue
+                if any(abs(axis.dot(x)) > 0.97 for x in tried.get(a, ())):
+                    continue
+
+                def is_side(p):
+                    n = normals[p]
+                    return p not in used and n is not None and abs(n.dot(axis)) < max_tilt
+                if not is_side(a) or not is_side(b):
+                    continue
+                comp, stack, nbrs, border = {a}, [a], {}, {}
+                while stack and len(comp) <= MAX_RING:
+                    p = stack.pop()
+                    for q in pn[p]:
+                        if not is_side(q):
+                            continue
+                        k = (min(p, q), max(p, q))
+                        if k not in border:
+                            border[k] = [ei for ei in inter[k] if abs(dirs[ei].dot(axis)) >= 0.7]
+                        if not border[k]:
+                            continue
+                        nbrs.setdefault(p, []).append(q)
+                        if q not in comp:
+                            comp.add(q)
+                            stack.append(q)
+                for p in comp:
+                    tried.setdefault(p, []).append(axis)
+                if len(comp) > MAX_RING:
+                    continue
+                if sum(self.area[fi] for p in comp for fi in self.panels[p]) > SMALL_RING_AREA * total_area:
+                    continue
+                try_band(a, comp, nbrs, {k: v for k, v in border.items() if v}, axis)
         if used:
             # one panel per band (glue-connected faces of the joined panels)
             joined = self._components([fi for p in sorted(used) for fi in self.panels[p]])
             self.panels = [idx for p, idx in enumerate(self.panels) if p not in used] + joined
-        self.stats["side_bands"] = bands
+        self.stats["side_bands"] = bands[0]
 
     # ------------------------------------------------------------------ shells
     def _thinness(self, idx):
@@ -885,13 +1000,80 @@ class PanelSolver:
             d = stretch_of.get(frozenset(shells[big]))
             return d is not None and d > HEADROOM * limit
 
+        local_check = getattr(self.validate, "local_check", None)
+
+        def local_ok(a, b):
+            """Cheap pre-check before a small piece joins a very big shell
+            (call it with the join glued). It can only refuse.
+
+            The union is the big shell re-unwrapped: about a second for a few
+            thousand faces, and a mesh with hundreds of small pieces asks
+            thousands of times. So the piece is first unwrapped with only the
+            few face rings of the big shell around it. If that patch overlaps
+            or flips, or the piece's own faces stretch past the ceiling there,
+            the join is refused without the big trial: it would fail, or pass
+            only because a few badly stretched faces vanish in the average of
+            thousands. (The four walls of a deep hole folded flat into the
+            hole are the typical case.) A join that passes here still goes
+            through the full trial like any other.
+            """
+            if local_check is None:
+                return True
+            big, small = (a, b) if len(shells[a]) >= len(shells[b]) else (b, a)
+            if (len(shells[big]) < LOCAL_MIN_FACES
+                    or len(shells[small]) * HEADROOM_SIZE > len(shells[big])):
+                return True
+            piece = set(shells[small])
+            seen, front = set(piece), list(shells[small])
+            for _ in range(LOCAL_RINGS):
+                nxt = []
+                for fi in front:
+                    for e in self.bm.faces[fi].edges:
+                        if not self.glued[e.index]:
+                            continue
+                        for g in e.link_faces:
+                            gi = g.index
+                            if gi not in seen and shell_of[gi] == big:
+                                seen.add(gi)
+                                nxt.append(gi)
+                front = nxt
+            if len(seen) == len(piece) or len(seen) == len(piece) + len(shells[big]):
+                return True
+            if local_check(self._faces(sorted(seen)), self.glued, piece, s.stretch_steps[-1]):
+                return True
+            self.stats["local_refusals"] = self.stats.get("local_refusals", 0) + 1
+            return False
+
+        def dense(a, b):
+            """A small piece against a shell big enough for ``local_ok``."""
+            big, small = (a, b) if len(shells[a]) >= len(shells[b]) else (b, a)
+            return (local_check is not None and len(shells[big]) >= LOCAL_MIN_FACES
+                    and len(shells[small]) * HEADROOM_SIZE <= len(shells[big]))
+
+        def cannot_join(x, y, eids):
+            """Small shell ``x`` is refused by the local pre-check on its
+            whole border with the big shell ``y``."""
+            if len(shells[x]) > len(shells[y]) or not dense(x, y):
+                return False
+            for ei in eids:
+                self.glued[ei] = True
+            ok = local_ok(x, y)
+            for ei in eids:
+                self.glued[ei] = False
+            return not ok
+
         def attempt(a, b, options, limit):
             if no_headroom(a, b, limit):
                 return False
             for glue in options:
+                # the deadline also holds between the options of one pair:
+                # two shells of 8k faces have dozens (hinges, relief cuts,
+                # darts) at several seconds each, and ran minutes past it
+                if out_of_time():
+                    return False
                 for ei in glue:
                     self.glued[ei] = True
-                if self._ok(shells[a] + shells[b], limit):
+                if local_ok(a, b) and self._ok(shells[a] + shells[b], limit):
                     if len(shells[a]) < len(shells[b]):
                         a, b = b, a
                     for fi in shells[b]:
@@ -958,14 +1140,37 @@ class PanelSolver:
                 d = stretch_of.get(frozenset(shells[big])) if stretch_of is not None else None
                 if d is not None and d > HEADROOM * limit:
                     continue
-                gkey = ("group", big, len(shells[big]), frozenset(x for x, _ in group), limit)
+                big_dense = local_check is not None and len(shells[big]) >= LOCAL_MIN_FACES
+                # On a big shell a group that failed is not tried again in
+                # this pass. (The key used to hold the shell's size, so every
+                # single merge onto it re-ran three failing unwraps of the
+                # whole shell: that, not the merging itself, used up the time
+                # budget on the 27k-face mesh.)
+                gkey = (("group", big, limit) if big_dense else
+                        ("group", big, len(shells[big]), frozenset(x for x, _ in group), limit))
                 if gkey in refused:
                     continue
-                refused.add(gkey)
+                if big_dense:
+                    # only pieces that pass the local pre-check on their own
+                    keep = []
+                    for x, eids in group:
+                        for ei in eids:
+                            self.glued[ei] = True
+                        if local_ok(big, x):
+                            keep.append((x, eids))
+                        for ei in eids:
+                            self.glued[ei] = False
+                    group = keep
+                    if len(group) < 2:
+                        refused.add(gkey)
+                        continue
+                else:
+                    refused.add(gkey)
                 half = len(group) // 2
                 for part in (group, group[:half], group[half:]):
                     if len(part) >= 2 and merge_group(big, part, limit):
                         return True
+                refused.add(gkey)
             return False
 
         def merge_group(big, part, limit):
@@ -1011,6 +1216,8 @@ class PanelSolver:
             return False
 
         refused = set()
+        merge_start = time.perf_counter()
+        pass_seconds = self.stats["merge_seconds"] = []  # running total after each pass
         n_steps = len(s.stretch_steps)
         for li, limit in enumerate(s.stretch_steps):
             # this pass, the rest, and the hinges
@@ -1045,6 +1252,23 @@ class PanelSolver:
                 if not merged:
                     break
             self.stats[f"shells_at_{limit}"] = len(shells)
+            pass_seconds.append(round(time.perf_counter() - merge_start, 1))
+            if li == 0 and local_check is not None:
+                # Small shells that the local pre-check refuses on every
+                # border (the wall strip of each hole in a mesh basket) can
+                # never join anything, whatever the stretch limit. Like
+                # separate parts they are left out of Max Shells: relaxing
+                # the stretch and hinging the other shells to make up for
+                # them only cost quality and minutes, and never got there.
+                stuck = 0
+                for x in list(shells):
+                    bd = borders(x)
+                    if bd and all(cannot_join(x, y, eids) for y, eids in bd.items()):
+                        stuck += 1
+                if stuck:
+                    target += stuck
+                    self.stats["stuck_shells"] = stuck
+                    self.stats["shell_target"] = target
 
         # Max Shells is a hard limit. If merges glued along whole borders
         # still fail at the stretch ceiling, join neighbours on a shorter
@@ -1055,6 +1279,12 @@ class PanelSolver:
         # stay above the limit (reported as ``max_shells_unmet``).
         ceiling = s.stretch_steps[-1]
         hinged = 0
+        # Hundreds of small shells round one huge one (the wall strips of the
+        # holes in a mesh basket) each cost relief cuts, hinges and darts on
+        # the huge shell, and none of it can work: there is no room next to
+        # a hole. After HINGE_STREAK such pieces in a row found nothing, the
+        # remaining ones are left as they are.
+        streak = 0
         start_pass(1)
         while len(shells) > target and not out_of_time():
             cands = []
@@ -1069,14 +1299,24 @@ class PanelSolver:
             for _p, a, b, eids, key in cands:
                 if out_of_time():
                     break
+                is_dense = dense(a, b)
+                if is_dense and streak >= HINGE_STREAK:
+                    self.stats["hinges_skipped"] = self.stats.get("hinges_skipped", 0) + 1
+                    refused.add(key)
+                    continue
                 if try_merge(a, b, eids, ceiling, hinge=True):
                     merged = True
                     hinged += 1
+                    if is_dense:
+                        streak = 0
                     break
+                if is_dense:
+                    streak += 1
                 refused.add(key)
             if not merged:
                 break
         self.stats["hinge_merges"] = hinged
+        pass_seconds.append(round(time.perf_counter() - merge_start, 1))
         if len(shells) > target:
             self.stats["max_shells_unmet"] = True
         self.shells = list(shells.values())

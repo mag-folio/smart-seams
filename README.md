@@ -77,7 +77,9 @@ shell. The solver ([`core/panels.py`](smart_seams/core/panels.py)) works the sam
 3. **Tube and cone cuts.** A panel that wraps round (cylinder wall, hole wall, a smooth leg) gets
    exactly one cut. Stacked quad rings are detected and cut along the same **edge loop**, at the
    least visible column, so the cut is one straight seam instead of a staircase. A cone or
-   pyramid tip gets one cut along the least visible path from the tip to its border.
+   pyramid tip gets one cut along the least visible path from the tip to its border. A dense
+   tube wall with holes in it (a mesh waste basket) is cut from one end to the other, between
+   the holes, instead of being split in two halves.
 4. **Splitting.** A panel that still cannot flatten without stretching is split in two,
    recursively. The split follows the panel's creases where it can, and falls back to its
    dominant normal direction.
@@ -85,7 +87,8 @@ shell. The solver ([`core/panels.py`](smart_seams/core/panels.py)) works the sam
    recess wall) is treated like one tube panel: it is joined into a single strip and cut once,
    on the least visible vertical border. A texture then flows round the sides with one seam,
    and both caps attach to the panel at one end of the strip (band plus caps, the way an artist
-   lays out a box).
+   lays out a box). Small rings are found at any angle, not only round the world axes: the
+   four walls of a hole through a tilted or curved surface become one strip per hole.
 6. **Shells.** Panels are merged into shells. Tiny and thin panels (bevel bands, small trims) go
    first, onto the neighbour they share the longest border with, so they lie flat instead of
    becoming skinny strips. After that, merges happen across the most visible borders first, so
@@ -100,6 +103,16 @@ shell. The solver ([`core/panels.py`](smart_seams/core/panels.py)) works the sam
    accepts longer seams to reach it: relief cuts, shorter hinges, darts. Overlap, flipped faces
    and stretch past the ceiling are never accepted; if no valid merge exists, the extra shells
    stay and are reported.
+
+   On dense meshes a small piece that wants to join a shell of 1000 faces or more is first
+   unwrapped together with only the few face rings of that shell around it. If that patch
+   overlaps, or the piece itself stretches past the ceiling there, the join is refused without
+   re-unwrapping the whole shell (it would fail, or pass only because a few badly stretched
+   faces vanish in the average of thousands). This pre-check can only refuse; a join that
+   passes it still goes through the full trial. Small shells it refuses on every border, such
+   as the wall strip of each hole in a mesh basket, cannot join anything at any stretch limit:
+   they are not counted towards *Max Shells*, so the solver does not relax the stretch or
+   hinge the other shells to make up for them.
 8. **Layout.** Final unwrap; all-quad strips are straightened with *Follow Active Quads* when that
    adds no stretch or overlap; shells are normalised to equal texel density, then scaled by
    visibility (*Hidden Shell Scale*). Grid-shaped shells are turned to line up with the UV grid,
@@ -175,9 +188,17 @@ test scripts exit non-zero on failure.
 
 - Packing efficiency on the table: the layout covers 38 % of the UV square, where the old
   auto-unwrap reached 62 %. The packer is also slow on some small meshes.
-- Dense meshes: a 4.1k-face mesh takes about 40 s and a 14.7k-face one about a minute (27
-  shells). A 27k-face mesh finishes in a few minutes because of the *Time Budget*, but with
-  hundreds of shells: merging its many small panels is still too slow to finish in the budget.
+- Dense meshes: a 4.1k-face mesh takes about 30 s and a 14.7k-face one about 45 s (27
+  shells, 27 separate parts). A 27k-face mesh basket with 258 holes takes about 90 s, well
+  inside the *Time Budget*, and gets 268 shells: one strip per hole wall plus the outer wall,
+  the inner wall, rim and bottom (it was about 800 shells in almost 6 minutes). The 256 strips
+  are a floor, not a time limit: the walls do not fold flat into their holes. Tested on
+  this mesh: the wall quarters folded onto the outer and inner wall need a stretch of 0.36
+  against a ceiling of 0.2 and overlap each other; so do two of the three rows of wall faces
+  (0.37); one row on each side fits (0.05) but leaves the middle row of every hole as a
+  shell of its own. Getting such a mesh down to a handful of shells would mean accepting
+  strongly stretched hole walls, which the solver does not do; a mode that does (for walls
+  nobody looks at) is not built.
   On Windows the window keeps responding during a long solve (`core/keepalive.py`), but it
   doesn't redraw until the object is done.
 - Simple meshes with several shells spend most of their time in packing, not in the solver.

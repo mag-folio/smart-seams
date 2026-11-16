@@ -375,6 +375,9 @@ Replaces the active UV map and the seams of the selected meshes"""
                 extra = f", {r['uv_overlap_pct']}% overlap"
             if (r.get("solver") or {}).get("time_budget_hit"):
                 extra += " (time budget reached: more shells than ideal)"
+            stuck = (r.get("solver") or {}).get("stuck_shells")
+            if stuck:
+                extra += f" ({stuck} small ones, such as hole walls, cannot join a neighbour without stretch or overlap)"
             items.append(f"{n} {_plural(shells, 'shell')}{extra}")
             if st.uv_name:
                 replaced.setdefault(st.uv_name, []).append(n)
