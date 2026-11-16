@@ -21,6 +21,8 @@ import math
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
+from . import keepalive
+
 
 def _hemisphere_dirs(count):
     """Deterministic, roughly uniform directions on the unit sphere (Fibonacci)."""
@@ -76,6 +78,8 @@ def face_visibility(bm, matrix_world, *, samples=48, use_ground=True,
     result = [1.0] * len(bm.faces)
 
     for f in bm.faces:
+        if f.index % 128 == 0:
+            keepalive.pulse()
         n = (normal_mat @ f.normal).normalized()
         c = matrix_world @ f.calc_center_median()
         origin = c + n * eps

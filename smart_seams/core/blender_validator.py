@@ -19,6 +19,7 @@ import bmesh
 import bpy
 import numpy as np
 
+from . import keepalive
 from .flatten import boundary_crossings, face_triangles
 
 TMP_NAME = "__smart_seams_validator__"
@@ -170,6 +171,7 @@ class BlenderValidator:
         return result
 
     def _notify(self):
+        keepalive.pulse()
         if on_call is not None:
             try:
                 on_call(self.calls)

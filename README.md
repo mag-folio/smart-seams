@@ -175,7 +175,9 @@ test scripts exit non-zero on failure.
 - Packing efficiency on the table: the layout covers 38 % of the UV square, where the old
   auto-unwrap reached 62 %. The packer is also slow on some small meshes.
 - Dense meshes (5k+ faces): small overlaps were reported and are not yet re-verified, and the
-  solve takes about a minute at 5.6k faces.
+  solve takes about a minute at 5.6k faces (measured on a real scene: 4.1k faces 46 s, 14.7k
+  faces 98 s, 27k faces over 4 minutes). On Windows the window keeps responding during a long
+  solve (`core/keepalive.py`), but it doesn't redraw until the object is done.
 - The table's remaining splits come from degenerate corner slivers.
 - Symmetry-aware seams (mirror seam placement on symmetric meshes).
 - Batch mode for whole collections.
